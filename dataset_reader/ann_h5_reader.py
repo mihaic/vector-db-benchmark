@@ -27,10 +27,11 @@ class AnnH5Reader(BaseReader):
                 expected_scores=expected_scores.tolist(),
             )
 
-    def read_data(self, *args, **kwargs) -> Iterator[Record]:
+    def read_data(self, upload_start_idx: int, upload_end_idx: int, *args, **kwargs) -> Iterator[Record]:
+        upload_end_idx_effective = None if upload_end_idx == -1 else upload_end_idx
         data = h5py.File(self.path)
 
-        for idx, vector in enumerate(data["train"]):
+        for idx, vector in enumerate(data["train"][upload_start_idx:upload_end_idx_effective]):
             if self.normalize:
                 vector /= np.linalg.norm(vector)
             yield Record(id=idx, vector=vector.tolist(), metadata=None)

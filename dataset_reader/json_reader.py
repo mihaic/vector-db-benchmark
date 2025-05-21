@@ -60,10 +60,12 @@ class JSONReader(BaseReader):
 
             yield Query(vector=vector, meta_conditions=None, expected_result=neighbours)
 
-    def read_data(self, *args, **kwargs) -> Iterator[Record]:
+    def read_data(self, upload_start_idx: int, upload_end_idx: int, *args, **kwargs) -> Iterator[Record]:
         for idx, (vector, payload) in enumerate(
             zip(self.read_vectors(), self.read_payloads())
         ):
+            if idx == upload_end_idx:
+                break
             yield Record(id=idx, vector=vector, metadata=payload)
 
 
