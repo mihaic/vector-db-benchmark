@@ -1235,5 +1235,29 @@
     "type": "h5",
     "path": "cohere-768-10M/cohere-768-10M.hdf5",
     "link": "https://dbyiw3u3rf9yr.cloudfront.net/corpora/vectorsearch/cohere-wikipedia-22-12-en-embeddings/documents-10m.hdf5.bz2"
+  },
+  {
+    "name": "dbpedia-openai-1M-text-embedding-3-large-512d",
+    "vector_size": 512,
+    "distance": "cosine",
+    "type": "h5",
+    "path": "dbpedia-openai-1M-text-embedding-3-large-512d.hdf5",
+    "link": "http://benchmarks.redislabs.s3.amazonaws.com/vecsim/dbpedia/dbpedia-openai-1M-text-embedding-3-large-512d.hdf5"
+  },
+  {
+    "name": "dbpedia-openai-1M-text-embedding-3-large-1536d",
+    "vector_size": 1536,
+    "distance": "cosine",
+    "type": "h5",
+    "path": "dbpedia-openai-1M-text-embedding-3-large-1536d.hdf5",
+    "link": "http://benchmarks.redislabs.s3.amazonaws.com/vecsim/dbpedia/dbpedia-openai-1M-text-embedding-3-large-1536d.hdf5"
+  },
+  {
+    "name": "dbpedia-openai-1M-text-embedding-3-large-3072d",
+    "vector_size": 3072,
+    "distance": "cosine",
+    "type": "h5",
+    "path": "dbpedia-openai-1M-text-embedding-3-large-3072d.hdf5",
+    "link": "http://benchmarks.redislabs.s3.amazonaws.com/vecsim/dbpedia/dbpedia-openai-1M-text-embedding-3-large-3072d.hdf5"
   }
 ]
