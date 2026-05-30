@@ -8,3 +8,4 @@ BASE_DIRECTORY = Path(__file__).parent.parent
 DATASETS_DIR = BASE_DIRECTORY / "datasets"
 CODE_DIR = os.path.dirname(__file__)
 ROOT_DIR = Path(os.path.dirname(CODE_DIR))
+TAG = os.environ.get("VDBB_TAG")

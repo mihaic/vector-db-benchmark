@@ -6,7 +6,7 @@ from typing import List, Dict, Any, Optional
 import warnings
 import random
 
-from benchmark import ROOT_DIR
+from benchmark import ROOT_DIR, TAG
 from benchmark.dataset import Dataset
 from dataset_reader.base_reader import BaseReader
 from engine.base_client.configure import BaseConfigurator
@@ -348,7 +348,13 @@ class BaseClient:
                 # Display results table and chart
                 self._display_results_summary(precision_summary, dataset.config.name)
 
-        summary_file = f"{self.name}-{dataset.config.name}-summary.json"
+        if TAG is not None:
+            tag_part = f"-{TAG}"
+        else:
+            tag_part = ""
+        timestamp = datetime.now().astimezone().isoformat().replace("-", "", 2).replace(":", "")
+
+        summary_file = f"{self.name}-{dataset.config.name}-summary-{timestamp}{tag_part}.json"
         summary_path = RESULTS_DIR / summary_file
         with open(summary_path, "w") as out:
             out.write(
