@@ -348,13 +348,9 @@ class BaseClient:
                 # Display results table and chart
                 self._display_results_summary(precision_summary, dataset.config.name)
 
-        if TAG is not None:
-            tag_part = f"-{TAG}"
-        else:
-            tag_part = ""
+        # ISO basic format (without separators) for brevity and compatibility
         timestamp = datetime.now().astimezone().isoformat().replace("-", "", 2).replace(":", "")
-
-        summary_file = f"{self.name}-{dataset.config.name}-summary-{timestamp}{tag_part}.json"
+        summary_file = f"{self.name}-{dataset.config.name}-summary-{timestamp}{TAG}.json"
         summary_path = RESULTS_DIR / summary_file
         with open(summary_path, "w") as out:
             out.write(
