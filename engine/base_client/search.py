@@ -381,7 +381,21 @@ class BaseSearcher:
                     "time_seconds": float(interval_time),  # Ensure it's a float
                     "total_rps": float(current_interval_size / interval_time),  # Overall RPS
                     "search_rps": float(search_rps),  # Search-only RPS
+                    "search_min": np.min(interval_search_latencies) if interval_search_latencies else None,
+                    "search_p25": np.percentile(interval_search_latencies, 25) if interval_search_latencies else None,
+                    "search_p50": np.percentile(interval_search_latencies, 50) if interval_search_latencies else None,
+                    "search_p75": np.percentile(interval_search_latencies, 75) if interval_search_latencies else None,
+                    "search_p95": np.percentile(interval_search_latencies, 95) if interval_search_latencies else None,
+                    "search_p99": np.percentile(interval_search_latencies, 99) if interval_search_latencies else None,
+                    "search_max": np.max(interval_search_latencies) if interval_search_latencies else None,
                     f"{modify_label}_rps": float(modify_rps),  # Insert or Update RPS
+                    f"{modify_label}_min": np.min(interval_modify_latencies) if interval_modify_latencies else None,
+                    f"{modify_label}_p25": np.percentile(interval_modify_latencies, 25) if interval_modify_latencies else None,
+                    f"{modify_label}_p50": np.percentile(interval_modify_latencies, 50) if interval_modify_latencies else None,
+                    f"{modify_label}_p75": np.percentile(interval_modify_latencies, 75) if interval_modify_latencies else None,
+                    f"{modify_label}_p95": np.percentile(interval_modify_latencies, 95) if interval_modify_latencies else None,
+                    f"{modify_label}_p99": np.percentile(interval_modify_latencies, 99) if interval_modify_latencies else None,
+                    f"{modify_label}_max": np.max(interval_modify_latencies) if interval_modify_latencies else None,
                     "searches": interval_search_count,
                     f"{modify_label}s": interval_modify_count,  # inserts or updates count
                     "search_precision": float(np.mean(interval_search_precisions)) if interval_search_precisions else None
