@@ -14,7 +14,7 @@
     },
     "search_params": [
       {
-        "parallel": 56,
+        "parallel": 100,
         "top": 100,
         "calibration_param": "ef",
         "calibration_precision": 0.95,
@@ -24,7 +24,7 @@
       }
     ],
     "upload_params": {
-      "parallel": 56,
+      "parallel": 100,
       "algorithm": "hnsw",
       "data_type": "FLOAT16"
     }
@@ -75,7 +75,7 @@
     "search_params": [
       {
         "algorithm": "svs-vamana",
-        "parallel": 56,
+        "parallel": 100,
         "top": 100,
         "calibration_param": "SEARCH_WINDOW_SIZE",
         "calibration_precision": 0.95,
@@ -85,7 +85,7 @@
       }
     ],
     "upload_params": {
-      "parallel": 56,
+      "parallel": 100,
       "data_type": "FLOAT16",
       "algorithm": "svs-vamana"
     }
@@ -363,7 +363,7 @@
     "search_params": [
       {
         "algorithm": "svs-vamana",
-        "parallel": 56,
+        "parallel": 100,
         "top": 100,
         "calibration_param": "SEARCH_WINDOW_SIZE",
         "calibration_precision": 0.95,
@@ -373,7 +373,7 @@
       }
     ],
     "upload_params": {
-      "parallel": 56,
+      "parallel": 100,
       "data_type": "FLOAT16",
       "algorithm": "svs-vamana"
     }
