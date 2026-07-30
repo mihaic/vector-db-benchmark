@@ -1007,7 +1007,7 @@
     "vector_size": 1536,
     "distance": "cosine",
     "type": "h5",
-    "path": "dbpedia-openai-900-1536-angular/dbpedia-1536-900K-100K-testvectors.hdf5",
+    "path": "dbpedia-openai-900K-1536-angular/dbpedia-1536-900K-100K-testvectors.hdf5",
     "vector_count": 900000,
     "description": "Knowledge embeddings"
   },
