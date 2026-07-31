@@ -8,7 +8,7 @@
       "data_type": "FLOAT16",
       "hnsw_config": {
         "M": 16,
-        "DISTANCE_METRIC": "L2",
+        "DISTANCE_METRIC": "IP",
         "EF_CONSTRUCTION": 200
       }
     },
@@ -38,7 +38,7 @@
       "data_type": "FLOAT32",
       "hnsw_config": {
         "M": 16,
-        "DISTANCE_METRIC": "L2",
+        "DISTANCE_METRIC": "IP",
         "EF_CONSTRUCTION": 200
       }
     },
@@ -67,7 +67,7 @@
       "algorithm": "svs-vamana",
       "data_type": "FLOAT16",
       "svs-vamana_config": {
-        "DISTANCE_METRIC": "L2",
+        "DISTANCE_METRIC": "IP",
         "GRAPH_MAX_DEGREE": 32,
         "CONSTRUCTION_WINDOW_SIZE": 200,
         "compression": "LVQ4X8"
@@ -99,7 +99,7 @@
       "algorithm": "svs-vamana",
       "data_type": "FLOAT32",
       "svs-vamana_config": {
-        "DISTANCE_METRIC": "L2",
+        "DISTANCE_METRIC": "IP",
         "GRAPH_MAX_DEGREE": 32,
         "CONSTRUCTION_WINDOW_SIZE": 200,
         "compression": "LVQ4X8"
@@ -131,7 +131,7 @@
       "algorithm": "svs-vamana",
       "data_type": "FLOAT32",
       "svs-vamana_config": {
-        "DISTANCE_METRIC": "L2",
+        "DISTANCE_METRIC": "IP",
         "GRAPH_MAX_DEGREE": 32,
         "CONSTRUCTION_WINDOW_SIZE": 200,
         "compression": "LVQ4X4"
@@ -163,7 +163,7 @@
       "algorithm": "svs-vamana",
       "data_type": "FLOAT16",
       "svs-vamana_config": {
-        "DISTANCE_METRIC": "L2",
+        "DISTANCE_METRIC": "IP",
         "GRAPH_MAX_DEGREE": 32,
         "CONSTRUCTION_WINDOW_SIZE": 200,
         "compression": "LVQ4X4"
@@ -195,7 +195,7 @@
       "algorithm": "svs-vamana",
       "data_type": "FLOAT16",
       "svs-vamana_config": {
-        "DISTANCE_METRIC": "L2",
+        "DISTANCE_METRIC": "IP",
         "GRAPH_MAX_DEGREE": 32,
         "CONSTRUCTION_WINDOW_SIZE": 200,
         "compression": "LeanVec4x8",
@@ -228,7 +228,7 @@
       "algorithm": "svs-vamana",
       "data_type": "FLOAT32",
       "svs-vamana_config": {
-        "DISTANCE_METRIC": "L2",
+        "DISTANCE_METRIC": "IP",
         "GRAPH_MAX_DEGREE": 32,
         "CONSTRUCTION_WINDOW_SIZE": 200,
         "compression": "LeanVec4x8",
@@ -261,7 +261,7 @@
       "algorithm": "svs-vamana",
       "data_type": "FLOAT16",
       "svs-vamana_config": {
-        "DISTANCE_METRIC": "L2",
+        "DISTANCE_METRIC": "IP",
         "GRAPH_MAX_DEGREE": 32,
         "CONSTRUCTION_WINDOW_SIZE": 200,
         "compression": "LeanVec4x8"
@@ -293,7 +293,7 @@
       "algorithm": "svs-vamana",
       "data_type": "FLOAT32",
       "svs-vamana_config": {
-        "DISTANCE_METRIC": "L2",
+        "DISTANCE_METRIC": "IP",
         "GRAPH_MAX_DEGREE": 32,
         "CONSTRUCTION_WINDOW_SIZE": 200,
         "compression": "LeanVec4x8"
