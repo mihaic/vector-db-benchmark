@@ -2443,11 +2443,22 @@ impl Engine for RedisEngine {
         let query_path = dataset.get_path()?;
         println!("\tReading queries from {}...", query_path.display());
         let (queries, neighbors, conditions) = dataset.read_queries()?;
+        if queries.is_empty() {
+            return Err("dataset contains no search queries".to_string());
+        }
 
         let parsed_filters: Vec<Option<ParsedFilter>> = conditions
             .iter()
             .map(|c| c.as_ref().and_then(parse_conditions))
             .collect();
+
+        // Workers recycle queries with `query_pos = idx % queries.len()` and index
+        // `neighbors[query_pos]` in lock-step; a ground-truth set shorter than the
+        // query set would panic a worker (aborting the whole run via
+        // `h.join().unwrap()`). Validate once up front for a clean error instead.
+        if neighbors.len() < queries.len() {
+            return Err("dataset ground-truth shorter than query set".into());
+        }
 
         // Read vectors for updates
         let normalize = dataset.needs_normalization();
@@ -2460,7 +2471,10 @@ impl Engine for RedisEngine {
         update_seq.shuffle(&mut rng);
 
         let explicit_top: Option<usize> = params.top.map(|t| t as usize);
-        let num_to_run = if num_queries > 0 {
+        let closed_loop_duration = closed_loop_duration(params)?;
+        let num_to_run = if closed_loop_duration.is_some() {
+            usize::MAX
+        } else if num_queries > 0 {
             (num_queries as usize).min(queries.len())
         } else {
             queries.len()
@@ -2476,7 +2490,11 @@ impl Engine for RedisEngine {
         let ratio_updates = ratio.updates as usize;
         let update_seq_len = update_seq.len();
 
-        let pb = self.create_progress_bar(num_to_run);
+        let pb = self.create_progress_bar(if closed_loop_duration.is_some() {
+            0
+        } else {
+            num_to_run
+        });
         let start_time = Instant::now();
 
         // Each worker accumulates search + update samples into thread-local
@@ -2485,11 +2503,16 @@ impl Engine for RedisEngine {
         // per query that serialized workers at high parallelism (matching the main
         // search() path). Dispatch counters use Relaxed (only their own
         // monotonicity matters) and the progress bar is advanced in batches.
-        let mut times: Vec<f64> = Vec::with_capacity(num_to_run);
-        let mut precs: Vec<f64> = Vec::with_capacity(num_to_run);
-        let mut recs: Vec<f64> = Vec::with_capacity(num_to_run);
-        let mut mrs: Vec<f64> = Vec::with_capacity(num_to_run);
-        let mut nds: Vec<f64> = Vec::with_capacity(num_to_run);
+        let sample_capacity = if closed_loop_duration.is_some() {
+            queries.len()
+        } else {
+            num_to_run
+        };
+        let mut times: Vec<f64> = Vec::with_capacity(sample_capacity);
+        let mut precs: Vec<f64> = Vec::with_capacity(sample_capacity);
+        let mut recs: Vec<f64> = Vec::with_capacity(sample_capacity);
+        let mut mrs: Vec<f64> = Vec::with_capacity(sample_capacity);
+        let mut nds: Vec<f64> = Vec::with_capacity(sample_capacity);
         let mut u_times: Vec<f64> = Vec::new();
 
         std::thread::scope(|s| {
@@ -2532,15 +2555,29 @@ impl Engine for RedisEngine {
                     };
 
                     'outer: loop {
+                        // Timer expiration is checked ONLY here, once per outer
+                        // iteration (one full search+update round) — not inside the
+                        // search/update phases below — so a round is never cut
+                        // half-searched/half-updated.
+                        if closed_loop_duration
+                            .map(|duration| Instant::now() >= start_time + duration)
+                            .unwrap_or(false)
+                        {
+                            break 'outer;
+                        }
                         // Search phase: do S searches
                         for _ in 0..ratio_searches {
                             let idx = search_idx.fetch_add(1, Ordering::Relaxed);
                             if idx >= num_to_run {
                                 break 'outer;
                             }
+                            // In duration mode `num_to_run` is `usize::MAX`, so `idx`
+                            // grows without bound; recycle queries in lock-step with
+                            // `neighbors`, matching search()'s `query_pos`.
+                            let query_pos = idx % queries.len();
 
                             let top = explicit_top.unwrap_or_else(|| {
-                                let n = neighbors[idx].len();
+                                let n = neighbors[query_pos].len();
                                 if n > 0 {
                                     n
                                 } else {
@@ -2553,11 +2590,11 @@ impl Engine for RedisEngine {
                             // build stay inside the timed window here to preserve
                             // its current measurement behavior exactly.
                             let query_start = Instant::now();
-                            let vec_bytes = encode_vector(&data_type, &queries[idx]);
+                            let vec_bytes = encode_vector(&data_type, &queries[query_pos]);
                             let query_str = build_knn_query_str(
                                 &algorithm,
                                 &hybrid_policy,
-                                parsed_filters[idx].as_ref(),
+                                parsed_filters[query_pos].as_ref(),
                             );
                             let results = ft_search_knn(
                                 &mut conn,
@@ -2569,7 +2606,7 @@ impl Engine for RedisEngine {
                                 &algorithm,
                                 &hybrid_policy,
                                 query_timeout,
-                                parsed_filters[idx].as_ref(),
+                                parsed_filters[query_pos].as_ref(),
                             );
                             let query_time = query_start.elapsed().as_secs_f64();
 
@@ -2579,7 +2616,8 @@ impl Engine for RedisEngine {
                                 Ok(result_ids) => {
                                     let ordered_ids: Vec<i64> =
                                         result_ids.iter().map(|(id, _)| *id).collect();
-                                    let m = compute_metrics(&ordered_ids, &neighbors[idx], top);
+                                    let m =
+                                        compute_metrics(&ordered_ids, &neighbors[query_pos], top);
                                     t.push(query_time);
                                     p.push(m.precision);
                                     r.push(m.recall);
@@ -2669,10 +2707,13 @@ impl Engine for RedisEngine {
         )?;
 
         // Search latency + quality stats through the shared percentile path so the
-        // mixed harness matches the main search() footing.
+        // mixed harness matches the main search() footing. `num_to_run` is
+        // `usize::MAX` in duration mode, so use the actual dispatched search count
+        // as `requested_queries` (mirrors search()'s `attempted_queries`).
+        let attempted_queries = search_idx.load(Ordering::Relaxed).min(num_to_run);
         let top = explicit_top.unwrap_or_else(|| neighbors.first().map(|n| n.len()).unwrap_or(10));
         let mut results = crate::engine::compute_search_stats(
-            &times, &precs, &recs, &mrs, &nds, total_time, top, parallel, num_to_run,
+            &times, &precs, &recs, &mrs, &nds, total_time, top, parallel, attempted_queries,
         )?;
         results.update_count = update_count;
         results.update_rps = update_rps;
