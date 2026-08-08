@@ -1033,6 +1033,15 @@
     "description": "Knowledge embeddings"
   },
   {
+    "name": "dbpedia-openai-1M-1536-angular-100neighbors_insert_100000_42_cosine",
+    "vector_size": 1536,
+    "distance": "cosine",
+    "type": "h5",
+    "path": "dbpedia-openai-1M-1536-angular-100neighbors/dbpedia_openai_1M_insert_100000_42_cosine.hdf5",
+    "vector_count": 900000,
+    "description": "Knowledge embeddings"
+  },
+  {
     "name": "h-and-m-2048-angular-filters",
     "vector_size": 2048,
     "distance": "cosine",
@@ -1356,6 +1365,15 @@
     "path": "cohere-768-1M/cohere-768-1M.hdf5",
     "link": "https://dbyiw3u3rf9yr.cloudfront.net/corpora/vectorsearch/cohere-wikipedia-22-12-en-embeddings/documents-1m.hdf5.bz2",
     "vector_count": 1000000,
+    "description": "Wikipedia embeddings"
+  },
+  {
+    "name": "cohere-768-1M_insert_100000_42_mip",
+    "vector_size": 768,
+    "distance": "dot",
+    "type": "h5",
+    "path": "cohere-768-1M/cohere-768-1M_insert_100000_42_mip.hdf5",
+    "vector_count": 900000,
     "description": "Wikipedia embeddings"
   },
   {

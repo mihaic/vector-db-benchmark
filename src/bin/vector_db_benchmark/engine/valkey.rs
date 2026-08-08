@@ -2025,6 +2025,7 @@ impl Engine for ValkeyEngine {
         params: &SearchParams,
         num_queries: i64,
         ratio: &UpdateSearchRatio,
+        _use_insert: bool,
     ) -> Result<SearchResults, String> {
         // Prime the datetime/text field-type maps from the schema so the update
         // half of the mixed workload encodes datetime payloads as epoch seconds

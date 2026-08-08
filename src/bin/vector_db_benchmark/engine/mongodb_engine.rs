@@ -1448,6 +1448,7 @@ impl Engine for MongoDBEngine {
         params: &SearchParams,
         num_queries: i64,
         ratio: &UpdateSearchRatio,
+        _use_insert: bool,
     ) -> Result<SearchResults, String> {
         // Ensure numeric payloads written during updates use native BSON types.
         self.load_schema_types(dataset);

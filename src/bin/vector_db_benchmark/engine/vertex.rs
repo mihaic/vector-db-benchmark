@@ -2114,6 +2114,7 @@ impl Engine for VertexEngine {
         params: &SearchParams,
         num_queries: i64,
         ratio: &UpdateSearchRatio,
+        _use_insert: bool,
     ) -> Result<SearchResults, String> {
         self.distance_measure = vertex_distance_measure(dataset.distance()).to_string();
 

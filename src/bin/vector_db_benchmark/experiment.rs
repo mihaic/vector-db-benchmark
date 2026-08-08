@@ -109,6 +109,14 @@ pub fn run(args: &Args) -> Result<(), String> {
         }
     }
 
+    if args.insert && args.search_duration > 0.0 {
+        return Err(
+            "--insert does not support --search-duration; a mixed --insert run stops once \
+             every insert vector has been used, not after a fixed duration"
+                .to_string(),
+        );
+    }
+
     let dataset_configs = read_dataset_configs()?;
     let engine_configs = read_engine_configs(args.engines_file.as_deref())?;
 
@@ -171,6 +179,25 @@ pub fn run(args: &Args) -> Result<(), String> {
         if !unsupported.is_empty() {
             return Err(format!(
                 "duration-bounded search currently supports Redis and Vertex only; unsupported: {}",
+                unsupported.join(", ")
+            ));
+        }
+    }
+
+    if args.insert {
+        if args.update_search_ratio.is_empty() {
+            return Err("--insert requires --update-search-ratio".to_string());
+        }
+        let unsupported: Vec<_> = engines
+            .iter()
+            .filter_map(|(name, config)| {
+                let engine_type = config.engine.as_deref().unwrap_or("unknown");
+                (engine_type != "redis").then_some(name.as_str())
+            })
+            .collect();
+        if !unsupported.is_empty() {
+            return Err(format!(
+                "--insert currently supports the Redis engine only; unsupported: {}",
                 unsupported.join(", ")
             ));
         }
@@ -715,9 +742,13 @@ fn run_single_experiment(
                     );
                     let search_result =
                         run_with_search_watchdog(args.search_timeout, &wd_label, || match phase {
-                            Some(ratio) => {
-                                engine.search_mixed(dataset, effective_params, args.queries, ratio)
-                            }
+                            Some(ratio) => engine.search_mixed(
+                                dataset,
+                                effective_params,
+                                args.queries,
+                                ratio,
+                                args.insert,
+                            ),
                             None => engine.search(dataset, effective_params, args.queries),
                         });
                     let cpu_after = crate::proc_cpu::sample();
@@ -1219,7 +1250,30 @@ fn save_upload_results(
 mod tests {
     use super::parse_update_search_ratio;
     use super::run_with_search_watchdog;
+    use crate::cli::Args;
     use crate::engine::UpdateSearchRatio;
+    use clap::Parser;
+
+    // --insert + --search-duration is rejected up front, before dataset/engine
+    // configs are even read — an --insert run stops when the insert vectors
+    // are exhausted, not on a wall-clock duration, so the two are incompatible.
+    #[test]
+    fn insert_rejects_search_duration() {
+        let args = Args::try_parse_from([
+            "vector-db-benchmark",
+            "--insert",
+            "--update-search-ratio",
+            "1:10",
+            "--search-duration",
+            "30",
+        ])
+        .unwrap();
+        let err = super::run(&args).unwrap_err();
+        assert!(
+            err.contains("--insert does not support --search-duration"),
+            "unexpected error: {err}"
+        );
+    }
 
     // Watchdog disabled (timeout <= 0, non-finite): must run `f` inline on the
     // current thread and return its value verbatim — the default, unchanged path.

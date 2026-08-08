@@ -168,6 +168,13 @@ pub struct Args {
     #[arg(long)]
     pub update_search_ratio: Vec<String>,
 
+    /// Mixed benchmark: draw the update half of the workload from the dataset's
+    /// `insert` set (new points) instead of re-upserting the existing corpus.
+    /// Only supported for HDF5 datasets carrying an `insert` dataset, and only
+    /// implemented by the Redis engine.
+    #[arg(long, default_value = "false")]
+    pub insert: bool,
+
     /// Skip vector indexing: upload vectors but don't index them, run filter-only queries.
     /// Collapses all M/EF variants of the same engine into a single "<engine>-no-vector" experiment.
     #[arg(long, default_value = "false")]
@@ -268,6 +275,12 @@ mod tests {
             "omitted → false (digests only)"
         );
         assert!(parse(&["--dump-raw-latencies"]).dump_raw_latencies);
+    }
+
+    #[test]
+    fn insert_flag_parses() {
+        assert!(!parse(&[]).insert, "omitted → false");
+        assert!(parse(&["--insert"]).insert);
     }
 
     // `--describe datasets|engines` is what the docker-build smoke test exercises;

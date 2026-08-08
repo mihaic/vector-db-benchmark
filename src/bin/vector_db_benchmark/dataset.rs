@@ -8,8 +8,8 @@ use crate::config::{datasets_dir, DatasetConfig};
 use crate::download;
 use vector_db_benchmark::readers::metadata::MetadataItem;
 use vector_db_benchmark::readers::{
-    read_compound_data, read_compound_queries, read_hdf5_vectors, read_jsonl_queries,
-    read_jsonl_vectors, read_npy_vectors, read_sparse_matrix, SparseVector,
+    read_compound_data, read_compound_queries, read_hdf5_insert_vectors, read_hdf5_vectors,
+    read_jsonl_queries, read_jsonl_vectors, read_npy_vectors, read_sparse_matrix, SparseVector,
 };
 
 /// Dataset wrapper that provides access to vectors and metadata
@@ -141,6 +141,38 @@ impl Dataset {
             }
             other => Err(format!("Unsupported dataset type: {}", other)),
         }
+    }
+
+    /// Read vectors from the dataset's `insert` set, meant to be inserted as NEW
+    /// points during a mixed benchmark (`--insert`) instead of re-upserting
+    /// existing points via [`Dataset::read_vectors`]. Only supported for HDF5
+    /// datasets (which must carry an `insert` dataset alongside `train`).
+    #[allow(clippy::type_complexity)]
+    pub fn read_insert_vectors(
+        &self,
+        normalize: bool,
+    ) -> Result<(Vec<i64>, Vec<Vec<f32>>, Vec<Option<MetadataItem>>), String> {
+        let path = self.get_path()?;
+        let path_str = path.to_str().ok_or("Invalid path encoding")?;
+        let dataset_type = self.config.dataset_type.as_deref().unwrap_or("");
+
+        let is_hdf5 = matches!(dataset_type, "hdf5" | "h5")
+            || (dataset_type.is_empty()
+                && matches!(
+                    path.extension().and_then(|e| e.to_str()).map(str::to_lowercase),
+                    Some(ref ext) if ext == "hdf5" || ext == "h5"
+                ));
+
+        if !is_hdf5 {
+            return Err(format!(
+                "--insert is only supported for HDF5 datasets (got dataset type '{}')",
+                dataset_type
+            ));
+        }
+
+        let (ids, vectors) = read_hdf5_insert_vectors(path_str, normalize)?;
+        let metadata: Vec<Option<MetadataItem>> = vec![None; vectors.len()];
+        Ok((ids, vectors, metadata))
     }
 
     /// Read query vectors, ground truth neighbors, and filter conditions from the dataset.
@@ -638,6 +670,26 @@ mod tests {
         let none = accessor_dataset(None, None, None);
         assert!(!none.is_sparse());
         assert!(!none.is_hybrid());
+    }
+
+    #[test]
+    fn read_insert_vectors_rejects_non_hdf5() {
+        let dir = tempfile::tempdir().unwrap();
+        // "tar" dataset_type resolves get_path() to this dir directly, so the
+        // rejection is reached without touching an actual insert dataset.
+        let ds = Dataset::new(DatasetConfig {
+            name: "not-hdf5".to_string(),
+            dataset_type: Some("tar".to_string()),
+            path: serde_json::Value::String(dir.path().to_str().unwrap().to_string()),
+            distance: None,
+            vector_size: None,
+            vector_count: None,
+            link: None,
+            schema: None,
+            description: None,
+        });
+        let err = ds.read_insert_vectors(false).unwrap_err();
+        assert!(err.contains("HDF5"), "got: {err}");
     }
 
     #[test]

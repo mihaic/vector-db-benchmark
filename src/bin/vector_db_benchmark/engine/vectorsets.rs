@@ -762,6 +762,7 @@ impl Engine for VectorSetsEngine {
         params: &SearchParams,
         num_queries: i64,
         ratio: &UpdateSearchRatio,
+        _use_insert: bool,
     ) -> Result<SearchResults, String> {
         let ef = params
             .search_params

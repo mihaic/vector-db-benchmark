@@ -432,12 +432,18 @@ pub trait Engine {
 
     /// Run mixed benchmark (interleaved search + update).
     /// Default: not supported. Override in engines that support it.
+    ///
+    /// `use_insert`: when true, the update half of the workload draws from the
+    /// dataset's `insert` set (new points, via `Dataset::read_insert_vectors`)
+    /// instead of re-upserting the existing corpus (`Dataset::read_vectors`).
+    /// Only honored by engines that implement `--insert`; others ignore it.
     fn search_mixed(
         &mut self,
         _dataset: &Dataset,
         _search_params: &SearchParams,
         _num_queries: i64,
         _ratio: &UpdateSearchRatio,
+        _use_insert: bool,
     ) -> Result<SearchResults, String> {
         Err(format!(
             "mixed benchmark not supported for engine '{}'",

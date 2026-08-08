@@ -2419,6 +2419,7 @@ impl Engine for RedisEngine {
         params: &SearchParams,
         num_queries: i64,
         ratio: &UpdateSearchRatio,
+        use_insert: bool,
     ) -> Result<SearchResults, String> {
         // Prime the datetime field-type map from the schema so the update half of
         // the mixed workload encodes datetime payloads as epoch seconds even on
@@ -2460,10 +2461,17 @@ impl Engine for RedisEngine {
             return Err("dataset ground-truth shorter than query set".into());
         }
 
-        // Read vectors for updates
+        // Read vectors for updates — from the dedicated `insert` set (new points)
+        // when --insert is passed, otherwise the same corpus used for the
+        // initial upload (re-upserting existing points).
         let normalize = dataset.needs_normalization();
-        println!("\tReading vectors for updates...");
-        let (upd_ids, upd_vectors, upd_metadata) = dataset.read_vectors(normalize)?;
+        let (upd_ids, upd_vectors, upd_metadata) = if use_insert {
+            println!("\tReading insert vectors for updates...");
+            dataset.read_insert_vectors(normalize)?
+        } else {
+            println!("\tReading vectors for updates...");
+            dataset.read_vectors(normalize)?
+        };
 
         // Create deterministic shuffled update sequence
         let mut update_seq: Vec<usize> = (0..upd_ids.len()).collect();
@@ -2472,7 +2480,13 @@ impl Engine for RedisEngine {
 
         let explicit_top: Option<usize> = params.top.map(|t| t as usize);
         let closed_loop_duration = closed_loop_duration(params)?;
-        let num_to_run = if closed_loop_duration.is_some() {
+        // With `--insert`, the run isn't bounded by the query count or a
+        // duration — it stops once every insert vector has been consumed
+        // exactly once (checked via `update_seq_len` below). Until then, query
+        // vectors keep recycling (`query_pos = idx % queries.len()`), same as
+        // duration mode.
+        let unbounded = closed_loop_duration.is_some() || use_insert;
+        let num_to_run = if unbounded {
             usize::MAX
         } else if num_queries > 0 {
             (num_queries as usize).min(queries.len())
@@ -2490,11 +2504,7 @@ impl Engine for RedisEngine {
         let ratio_updates = ratio.updates as usize;
         let update_seq_len = update_seq.len();
 
-        let pb = self.create_progress_bar(if closed_loop_duration.is_some() {
-            0
-        } else {
-            num_to_run
-        });
+        let pb = self.create_progress_bar(if unbounded { 0 } else { num_to_run });
         let start_time = Instant::now();
 
         // Each worker accumulates search + update samples into thread-local
@@ -2503,11 +2513,7 @@ impl Engine for RedisEngine {
         // per query that serialized workers at high parallelism (matching the main
         // search() path). Dispatch counters use Relaxed (only their own
         // monotonicity matters) and the progress bar is advanced in batches.
-        let sample_capacity = if closed_loop_duration.is_some() {
-            queries.len()
-        } else {
-            num_to_run
-        };
+        let sample_capacity = if unbounded { queries.len() } else { num_to_run };
         let mut times: Vec<f64> = Vec::with_capacity(sample_capacity);
         let mut precs: Vec<f64> = Vec::with_capacity(sample_capacity);
         let mut recs: Vec<f64> = Vec::with_capacity(sample_capacity);
@@ -2635,9 +2641,16 @@ impl Engine for RedisEngine {
                             }
                         }
 
-                        // Update phase: do U updates
+                        // Update phase: do U updates. With `--insert`, each
+                        // insert vector must be used exactly once, so the
+                        // phase (and the whole run) stops the instant the
+                        // insert set is exhausted rather than wrapping back
+                        // over already-used vectors.
                         for _ in 0..ratio_updates {
                             let uidx = update_idx.fetch_add(1, Ordering::Relaxed);
+                            if use_insert && uidx >= update_seq_len {
+                                break 'outer;
+                            }
                             let data_idx = update_seq[uidx % update_seq_len];
 
                             let update_start = Instant::now();
