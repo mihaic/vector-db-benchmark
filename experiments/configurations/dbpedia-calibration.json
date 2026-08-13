@@ -60,6 +60,37 @@
     }
   },
   {
+    "name": "dbpedia-cal-svs-noquant-float32",
+    "engine": "redis",
+    "connection_params": {},
+    "collection_params": {
+      "algorithm": "svs-vamana",
+      "data_type": "FLOAT32",
+      "svs-vamana_config": {
+        "DISTANCE_METRIC": "IP",
+        "GRAPH_MAX_DEGREE": 32,
+        "CONSTRUCTION_WINDOW_SIZE": 200
+      }
+    },
+    "search_params": [
+      {
+        "algorithm": "svs-vamana",
+        "parallel": 100,
+        "top": 100,
+        "calibration_param": "SEARCH_WINDOW_SIZE",
+        "calibration_precision": 0.95,
+        "search_params": {
+          "data_type": "FLOAT32"
+        }
+      }
+    ],
+    "upload_params": {
+      "parallel": 100,
+      "data_type": "FLOAT32",
+      "algorithm": "svs-vamana"
+    }
+  },
+  {
     "name": "dbpedia-cal-svs-noquant-float16",
     "engine": "redis",
     "connection_params": {},
