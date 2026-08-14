@@ -8,8 +8,9 @@ use crate::config::{datasets_dir, DatasetConfig};
 use crate::download;
 use vector_db_benchmark::readers::metadata::MetadataItem;
 use vector_db_benchmark::readers::{
-    read_compound_data, read_compound_queries, read_hdf5_insert_vectors, read_hdf5_vectors,
-    read_jsonl_queries, read_jsonl_vectors, read_npy_vectors, read_sparse_matrix, SparseVector,
+    read_compound_data, read_compound_queries, read_hdf5_all_neighbors, read_hdf5_insert_vectors,
+    read_hdf5_vectors, read_jsonl_queries, read_jsonl_vectors, read_npy_vectors,
+    read_sparse_matrix, SparseVector,
 };
 
 /// Dataset wrapper that provides access to vectors and metadata
@@ -156,14 +157,7 @@ impl Dataset {
         let path_str = path.to_str().ok_or("Invalid path encoding")?;
         let dataset_type = self.config.dataset_type.as_deref().unwrap_or("");
 
-        let is_hdf5 = matches!(dataset_type, "hdf5" | "h5")
-            || (dataset_type.is_empty()
-                && matches!(
-                    path.extension().and_then(|e| e.to_str()).map(str::to_lowercase),
-                    Some(ref ext) if ext == "hdf5" || ext == "h5"
-                ));
-
-        if !is_hdf5 {
+        if !is_hdf5_path(&path, dataset_type) {
             return Err(format!(
                 "--insert is only supported for HDF5 datasets (got dataset type '{}')",
                 dataset_type
@@ -173,6 +167,28 @@ impl Dataset {
         let (ids, vectors) = read_hdf5_insert_vectors(path_str, normalize)?;
         let metadata: Vec<Option<MetadataItem>> = vec![None; vectors.len()];
         Ok((ids, vectors, metadata))
+    }
+
+    /// Read the `allneighbors` ground-truth dataset: nearest neighbors for each
+    /// query against the FULL corpus once every `insert` vector has been added,
+    /// as opposed to [`Dataset::read_queries`]'s `neighbors` (ground truth
+    /// against `train` alone). Used by the `--insert` mixed benchmark to verify
+    /// recall once the insert phase has finished. Only supported for HDF5
+    /// datasets, and only some `--insert` datasets carry it — callers should
+    /// treat the error as skippable rather than fatal.
+    pub fn read_all_neighbors(&self) -> Result<Vec<Vec<i64>>, String> {
+        let path = self.get_path()?;
+        let path_str = path.to_str().ok_or("Invalid path encoding")?;
+        let dataset_type = self.config.dataset_type.as_deref().unwrap_or("");
+
+        if !is_hdf5_path(&path, dataset_type) {
+            return Err(format!(
+                "allneighbors ground truth is only supported for HDF5 datasets (got dataset type '{}')",
+                dataset_type
+            ));
+        }
+
+        read_hdf5_all_neighbors(path_str)
     }
 
     /// Read query vectors, ground truth neighbors, and filter conditions from the dataset.
@@ -417,6 +433,20 @@ impl Dataset {
 /// the interior is rejected (a blanket "skip empty lines" would shift every
 /// subsequent row up by one and silently corrupt recall). Exactly one trailing
 /// newline is tolerated.
+/// True when `path`/`dataset_type` resolve to an HDF5 dataset: either an
+/// explicit `hdf5`/`h5` `dataset_type`, or an unset type whose path extension
+/// is `.hdf5`/`.h5`. Shared by [`Dataset::read_insert_vectors`] and
+/// [`Dataset::read_all_neighbors`], which are both HDF5-only extensions to the
+/// mixed `--insert` benchmark.
+fn is_hdf5_path(path: &std::path::Path, dataset_type: &str) -> bool {
+    matches!(dataset_type, "hdf5" | "h5")
+        || (dataset_type.is_empty()
+            && matches!(
+                path.extension().and_then(|e| e.to_str()).map(str::to_lowercase),
+                Some(ref ext) if ext == "hdf5" || ext == "h5"
+            ))
+}
+
 fn read_neighbours_strict(path: &std::path::Path) -> Result<Vec<Vec<i64>>, String> {
     let raw =
         std::fs::read_to_string(path).map_err(|e| format!("read {}: {}", path.display(), e))?;

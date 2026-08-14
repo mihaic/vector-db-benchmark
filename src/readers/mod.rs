@@ -11,7 +11,7 @@ mod sparse_reader;
 pub use compound_reader::{
     read_compound_data, read_compound_queries, read_compound_vectors_only, read_payloads_jsonl,
 };
-pub use hdf5_reader::{read_hdf5_insert_vectors, read_hdf5_vectors};
+pub use hdf5_reader::{read_hdf5_all_neighbors, read_hdf5_insert_vectors, read_hdf5_vectors};
 pub use jsonl_reader::{read_jsonl_queries, read_jsonl_vectors};
 pub use metadata::{parse_metadata_from_json, MetadataItem, MetadataValue};
 pub use npy_reader::{read_npy_vectors, write_npy_vectors};

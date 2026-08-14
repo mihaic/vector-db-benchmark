@@ -1188,6 +1188,27 @@ fn save_search_results(
         }
     }
 
+    // Add post-insert full-corpus recall (mixed `--insert` benchmark, when the
+    // dataset carries `allneighbors` ground truth). Absent when `--insert` was
+    // not used or the dataset predates `allneighbors`.
+    if let Some(mean_recall) = results.post_insert_mean_recall {
+        let results_obj = result["results"].as_object_mut().unwrap();
+        results_obj.insert("post_insert_mean_recall".to_string(), json!(mean_recall));
+        results_obj.insert(
+            "post_insert_recall_p10".to_string(),
+            json!(results.post_insert_recall_p10),
+        );
+        if let Some(ref recalls) = results.post_insert_recalls {
+            results_obj.insert(
+                "post_insert_recall_dist".to_string(),
+                crate::latency_digest::quality_dist(recalls),
+            );
+            if dump_raw_latencies {
+                results_obj.insert("post_insert_recalls".to_string(), json!(recalls));
+            }
+        }
+    }
+
     // Embed server reproducibility metadata (Redis-wire engines only). Both
     // before and after are stored; a None side is serialized as null. Omitted
     // entirely when the engine reports no metadata (non-Redis engines).

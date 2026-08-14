@@ -71,11 +71,47 @@ pub fn read_hdf5_insert_vectors(
     Ok((ids, vectors))
 }
 
+/// Read the `allneighbors` dataset from an HDF5 file: ground-truth nearest
+/// neighbors for each query computed against the FULL post-insert corpus
+/// (`train` + `insert`), unlike `neighbors` which is ground truth against
+/// `train` alone. Used to measure recall once a mixed `--insert` benchmark has
+/// finished ingesting every insert vector. Not every `--insert` dataset carries
+/// this (it predates the feature for some), so callers should treat a missing
+/// dataset as an optional/skippable condition rather than fatal.
+pub fn read_hdf5_all_neighbors(path: &str) -> Result<Vec<Vec<i64>>, String> {
+    let file = Hdf5File::open(path).map_err(|e| format!("Failed to open HDF5 file: {}", e))?;
+    let ds = file
+        .dataset("allneighbors")
+        .map_err(|e| format!("Failed to open 'allneighbors' dataset: {}", e))?;
+
+    let shape = ds.shape();
+    if shape.len() != 2 {
+        return Err("Expected 2D allneighbors dataset".to_string());
+    }
+    let num_queries = shape[0];
+    let k = shape[1];
+
+    let flat: Vec<i64> = ds
+        .read_raw()
+        .map_err(|e| format!("Failed to read 'allneighbors' dataset: {}", e))?;
+
+    Ok(flat
+        .chunks(k)
+        .take(num_queries)
+        .map(|chunk| chunk.to_vec())
+        .collect())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn write_hdf5(dir: &std::path::Path, name: &str, train: &[[f32; 2]], insert: &[[f32; 2]]) -> std::path::PathBuf {
+    fn write_hdf5(
+        dir: &std::path::Path,
+        name: &str,
+        train: &[[f32; 2]],
+        insert: &[[f32; 2]],
+    ) -> std::path::PathBuf {
         let path = dir.join(name);
         let file = Hdf5File::create(&path).unwrap();
         let write = |ds_name: &str, data: &[[f32; 2]]| {
@@ -92,6 +128,17 @@ mod tests {
             write("insert", insert);
         }
         path
+    }
+
+    fn write_i64_dataset(file: &Hdf5File, ds_name: &str, rows: &[Vec<i64>]) {
+        let cols = rows.first().map(|r| r.len()).unwrap_or(0);
+        let ds = file
+            .new_dataset::<i64>()
+            .shape((rows.len(), cols))
+            .create(ds_name)
+            .unwrap();
+        let flat: Vec<i64> = rows.iter().flatten().copied().collect();
+        ds.write_raw(&flat).unwrap();
     }
 
     #[test]
@@ -114,5 +161,29 @@ mod tests {
 
         let err = read_hdf5_insert_vectors(path.to_str().unwrap(), false).unwrap_err();
         assert!(err.contains("insert"), "got: {err}");
+    }
+
+    #[test]
+    fn reads_all_neighbors_dataset() {
+        let dir = tempfile::tempdir().unwrap();
+        let train = [[1.0, 0.0], [0.0, 1.0]];
+        let path = write_hdf5(dir.path(), "d.hdf5", &train, &[]);
+        let file = Hdf5File::open_rw(&path).unwrap();
+        let rows = vec![vec![1i64, 2, 3], vec![4, 5, 6]];
+        write_i64_dataset(&file, "allneighbors", &rows);
+        drop(file);
+
+        let got = read_hdf5_all_neighbors(path.to_str().unwrap()).unwrap();
+        assert_eq!(got, rows);
+    }
+
+    #[test]
+    fn all_neighbors_missing_dataset_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let train = [[1.0, 0.0], [0.0, 1.0]];
+        let path = write_hdf5(dir.path(), "d.hdf5", &train, &[]);
+
+        let err = read_hdf5_all_neighbors(path.to_str().unwrap()).unwrap_err();
+        assert!(err.contains("allneighbors"), "got: {err}");
     }
 }

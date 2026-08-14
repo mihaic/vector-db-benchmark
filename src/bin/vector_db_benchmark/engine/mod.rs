@@ -130,6 +130,15 @@ pub struct SearchResults {
     pub update_p99_time: Option<f64>,
     pub update_latencies: Option<Vec<f64>>,
     pub update_search_ratio: Option<String>,
+    // Post-insert full-corpus recall (mixed `--insert` benchmark only): a fresh
+    // search pass over every query, run once all insert vectors have been
+    // ingested, scored against the dataset's `allneighbors` ground truth
+    // (`train` + `insert` combined) rather than `neighbors` (`train` alone).
+    // None when not applicable (search-only, `--insert` unset, or the dataset
+    // has no `allneighbors` set).
+    pub post_insert_mean_recall: Option<f64>,
+    pub post_insert_recall_p10: Option<f64>,
+    pub post_insert_recalls: Option<Vec<f64>>,
 }
 
 /// Deterministic arrival schedule for fixed-rate, open-loop search.

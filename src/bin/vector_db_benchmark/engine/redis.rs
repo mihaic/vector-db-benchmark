@@ -950,6 +950,145 @@ impl RedisEngine {
         Ok(results)
     }
 
+    /// After a mixed `--insert` run has ingested every insert vector, run one
+    /// fresh pass over `queries` against the now-fully-merged corpus and score
+    /// it against `dataset`'s `allneighbors` ground truth. Returns
+    /// (mean_recall, recall_p10, per_query_recalls). Not a timed benchmark —
+    /// it exists to confirm the index is finding the *right* full-corpus
+    /// answers, not to measure latency/QPS.
+    #[allow(clippy::too_many_arguments)]
+    fn verify_post_insert_recall(
+        &self,
+        dataset: &Dataset,
+        queries: &[Vec<f32>],
+        parsed_filters: &[Option<ParsedFilter>],
+        explicit_top: Option<usize>,
+        ef: i64,
+        hybrid_policy: &str,
+        query_timeout: i64,
+    ) -> Result<(f64, f64, Vec<f64>), String> {
+        let all_neighbors = dataset.read_all_neighbors()?;
+        if all_neighbors.len() < queries.len() {
+            return Err(format!(
+                "allneighbors has {} rows, fewer than the {} queries",
+                all_neighbors.len(),
+                queries.len()
+            ));
+        }
+
+        println!(
+            "\tVerifying recall against the full post-insert corpus ({} queries)...",
+            queries.len()
+        );
+
+        let encoded_queries: Vec<Vec<u8>> = queries
+            .iter()
+            .map(|q| encode_vector(&self.config.data_type, q))
+            .collect();
+        let query_strs: Vec<String> = parsed_filters
+            .iter()
+            .map(|f| build_knn_query_str(&self.config.algorithm, hybrid_policy, f.as_ref()))
+            .collect();
+
+        let query_idx = Arc::new(AtomicUsize::new(0));
+        let index_name = self.config.index_name.clone();
+        let algorithm = self.config.algorithm.clone();
+        let parallel = self.config.parallel.max(1);
+        let pb = self.create_progress_bar(queries.len());
+        let mut recalls: Vec<f64> = Vec::with_capacity(queries.len());
+
+        std::thread::scope(|s| {
+            let mut handles = Vec::with_capacity(parallel);
+            for _ in 0..parallel {
+                let redis_url = self.redis_url.clone();
+                let algorithm = algorithm.clone();
+                let encoded_queries = &encoded_queries;
+                let query_strs = &query_strs;
+                let all_neighbors = &all_neighbors;
+                let query_idx = Arc::clone(&query_idx);
+                let index_name = index_name.as_str();
+                let pb = &pb;
+
+                handles.push(s.spawn(move || {
+                    let mut local: Vec<f64> = Vec::new();
+                    let mut pb_pending: u64 = 0;
+
+                    let client = match redis::Client::open(redis_url.as_str()) {
+                        Ok(c) => c,
+                        Err(_) => return local,
+                    };
+                    let mut conn = match client.get_connection() {
+                        Ok(c) => c,
+                        Err(_) => return local,
+                    };
+
+                    loop {
+                        let idx = query_idx.fetch_add(1, Ordering::Relaxed);
+                        if idx >= encoded_queries.len() {
+                            break;
+                        }
+                        let top = explicit_top.unwrap_or_else(|| {
+                            let n = all_neighbors[idx].len();
+                            if n > 0 {
+                                n
+                            } else {
+                                10
+                            }
+                        });
+                        let cmd = build_ft_search_cmd(
+                            index_name,
+                            &encoded_queries[idx],
+                            &query_strs[idx],
+                            top,
+                            ef,
+                            &algorithm,
+                            hybrid_policy,
+                            query_timeout,
+                            parsed_filters[idx].as_ref(),
+                        );
+                        match exec_ft_search(&mut conn, &cmd) {
+                            Ok(result_ids) => {
+                                let ordered_ids: Vec<i64> =
+                                    result_ids.iter().map(|(id, _)| *id).collect();
+                                let m = compute_metrics(&ordered_ids, &all_neighbors[idx], top);
+                                local.push(m.recall);
+                            }
+                            Err(e) => {
+                                eprintln!("Post-insert recall query {} failed: {}", idx, e);
+                            }
+                        }
+                        pb_pending += 1;
+                        if pb_pending >= 256 {
+                            pb.inc(pb_pending);
+                            pb_pending = 0;
+                        }
+                    }
+                    if pb_pending > 0 {
+                        pb.inc(pb_pending);
+                    }
+                    local
+                }));
+            }
+
+            for h in handles {
+                recalls.extend(h.join().unwrap());
+            }
+        });
+
+        pb.finish_and_clear();
+
+        if recalls.is_empty() {
+            return Err("No post-insert recall queries completed".to_string());
+        }
+
+        let mean_recall = recalls.iter().sum::<f64>() / recalls.len() as f64;
+        let mut sorted = recalls.clone();
+        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let recall_p10 = crate::engine::percentile_linear(&sorted, 0.10);
+
+        Ok((mean_recall, recall_p10, recalls))
+    }
+
     fn create_progress_bar(&self, total: usize) -> ProgressBar {
         let pb = ProgressBar::new(total as u64);
         pb.set_style(
@@ -2726,7 +2865,15 @@ impl Engine for RedisEngine {
         let attempted_queries = search_idx.load(Ordering::Relaxed).min(num_to_run);
         let top = explicit_top.unwrap_or_else(|| neighbors.first().map(|n| n.len()).unwrap_or(10));
         let mut results = crate::engine::compute_search_stats(
-            &times, &precs, &recs, &mrs, &nds, total_time, top, parallel, attempted_queries,
+            &times,
+            &precs,
+            &recs,
+            &mrs,
+            &nds,
+            total_time,
+            top,
+            parallel,
+            attempted_queries,
         )?;
         results.update_count = update_count;
         results.update_rps = update_rps;
@@ -2736,6 +2883,39 @@ impl Engine for RedisEngine {
         results.update_p99_time = update_p99;
         results.update_latencies = Some(u_times);
         results.update_search_ratio = Some(format!("{}:{}", ratio.updates, ratio.searches));
+
+        // With `--insert`, the corpus now holds every insert vector. `neighbors`
+        // (used by the search phase above) is ground truth against `train`
+        // alone, so it understates recall once the insert half is live — run
+        // one fresh pass over the query set and score it against
+        // `allneighbors` (ground truth against the FULL merged corpus).
+        // Best-effort: some `--insert` datasets predate `allneighbors`, so a
+        // missing dataset just skips this phase rather than failing the run.
+        if use_insert {
+            match self.verify_post_insert_recall(
+                dataset,
+                &queries,
+                &parsed_filters,
+                explicit_top,
+                ef,
+                &hybrid_policy,
+                query_timeout,
+            ) {
+                Ok((mean_recall, recall_p10, recalls)) => {
+                    println!(
+                        "\tPost-insert recall (allneighbors): mean={:.4}, p10={:.4}",
+                        mean_recall, recall_p10
+                    );
+                    results.post_insert_mean_recall = Some(mean_recall);
+                    results.post_insert_recall_p10 = Some(recall_p10);
+                    results.post_insert_recalls = Some(recalls);
+                }
+                Err(e) => {
+                    println!("\tSkipping post-insert recall check: {}", e);
+                }
+            }
+        }
+
         Ok(results)
     }
 

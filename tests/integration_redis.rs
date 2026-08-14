@@ -2828,3 +2828,231 @@ fn test_binary_redis_skip_upload_without_prior_upload_errors() {
 
     fs::remove_dir_all(&root).ok();
 }
+
+/// Write an HDF5 dataset carrying `train`/`insert`/`test`/`neighbors`/
+/// `allneighbors`, and a project layout (datasets.json + engine config) that
+/// points at it. `neighbors` is ground truth against `train` alone;
+/// `allneighbors` is ground truth against `train`+`insert` combined — mirrors
+/// the real `*_insert_*` HDF5 datasets used by `--insert` (e.g.
+/// cohere-768-1M_insert_100000_42_mip.hdf5).
+#[allow(clippy::too_many_arguments)]
+fn create_test_project_hdf5(
+    dataset_name: &str,
+    engine_configs_json: &str,
+    train: &[Vec<f32>],
+    insert: &[Vec<f32>],
+    test: &[Vec<f32>],
+    neighbors: &[Vec<i64>],
+    all_neighbors: &[Vec<i64>],
+    distance: &str,
+    dim: usize,
+) -> PathBuf {
+    let tmp = tempfile::tempdir().expect("Failed to create temp dir");
+    let root = tmp.path().to_path_buf();
+    std::mem::forget(tmp);
+
+    let dataset_dir = root.join("datasets").join(dataset_name);
+    fs::create_dir_all(&dataset_dir).unwrap();
+    fs::create_dir_all(root.join("experiments/configurations")).unwrap();
+    fs::create_dir_all(root.join("results")).unwrap();
+
+    let hdf5_path = dataset_dir.join(format!("{}.hdf5", dataset_name));
+    let file = hdf5::File::create(&hdf5_path).expect("create hdf5 file");
+    let write_f32 = |name: &str, rows: &[Vec<f32>]| {
+        let ds = file
+            .new_dataset::<f32>()
+            .shape((rows.len(), dim))
+            .create(name)
+            .unwrap();
+        let flat: Vec<f32> = rows.iter().flatten().copied().collect();
+        ds.write_raw(&flat).unwrap();
+    };
+    let write_i64 = |name: &str, rows: &[Vec<i64>]| {
+        let cols = rows.first().map(|r| r.len()).unwrap_or(0);
+        let ds = file
+            .new_dataset::<i64>()
+            .shape((rows.len(), cols))
+            .create(name)
+            .unwrap();
+        let flat: Vec<i64> = rows.iter().flatten().copied().collect();
+        ds.write_raw(&flat).unwrap();
+    };
+    write_f32("train", train);
+    write_f32("insert", insert);
+    write_f32("test", test);
+    write_i64("neighbors", neighbors);
+    write_i64("allneighbors", all_neighbors);
+    drop(file);
+
+    let datasets_json = serde_json::json!([{
+        "name": dataset_name,
+        "type": "hdf5",
+        "path": format!("{}/{}.hdf5", dataset_name, dataset_name),
+        "distance": distance,
+        "vector_size": dim,
+        "vector_count": train.len(),
+    }]);
+    fs::write(
+        root.join("datasets/datasets.json"),
+        serde_json::to_string_pretty(&datasets_json).unwrap(),
+    )
+    .unwrap();
+
+    fs::write(
+        root.join("experiments/configurations/test.json"),
+        engine_configs_json,
+    )
+    .unwrap();
+
+    root
+}
+
+/// End-to-end coverage for the post-insert recall phase (`allneighbors`):
+/// after a `--insert` mixed run has ingested every insert vector, the engine
+/// must run one fresh pass over the query set scored against `allneighbors`
+/// (ground truth against the FULL train+insert corpus) and surface it as
+/// `post_insert_mean_recall` in the results JSON.
+#[test]
+fn test_binary_redis_insert_post_recall() {
+    wait_for_redis();
+    let mut conn = get_test_connection();
+    flush_db(&mut conn);
+
+    let dim = 8;
+    let train_count = 40;
+    let insert_count = 20;
+    let num_queries = 5;
+    let top = 5;
+
+    let (_, train) = generate_test_vectors(train_count, dim);
+    let (_, insert) = generate_test_vectors(insert_count, dim);
+    let queries: Vec<Vec<f32>> = train[..num_queries].to_vec();
+
+    // `neighbors`: ground truth against `train` alone.
+    let neighbors: Vec<Vec<i64>> = queries
+        .iter()
+        .map(|q| brute_force_neighbors(q, &train, top))
+        .collect();
+    // `allneighbors`: ground truth against the merged train+insert corpus.
+    // Ids stay aligned with `read_hdf5_insert_vectors`, which assigns insert
+    // ids `train_count..train_count+insert_count` — exactly the offset a
+    // concatenated brute-force search over `train` then `insert` produces.
+    let merged: Vec<Vec<f32>> = train
+        .iter()
+        .cloned()
+        .chain(insert.iter().cloned())
+        .collect();
+    let all_neighbors: Vec<Vec<i64>> = queries
+        .iter()
+        .map(|q| brute_force_neighbors(q, &merged, top))
+        .collect();
+
+    let engine_config = serde_json::json!([{
+        "name": "test-redis-insert",
+        "engine": "redis",
+        "algorithm": "hnsw",
+        "collection_params": {
+            "hnsw_config": { "M": 16, "EF_CONSTRUCTION": 128 }
+        },
+        "search_params": [{
+            "parallel": 1,
+            "search_params": { "ef": 256 },
+            "top": top,
+        }],
+        "upload_params": {
+            "data_type": "FLOAT32",
+            "parallel": 1,
+            "batch_size": 64
+        }
+    }]);
+
+    let project_root = create_test_project_hdf5(
+        "test-insert",
+        &serde_json::to_string_pretty(&engine_config).unwrap(),
+        &train,
+        &insert,
+        &queries,
+        &neighbors,
+        &all_neighbors,
+        "l2",
+        dim,
+    );
+
+    let bin = binary_path();
+    assert!(bin.exists(), "Binary not found at {:?}", bin);
+
+    // ratio 1:1, insert_count=20 → 20 update rounds. Each outer iteration does
+    // 1 search then 1 update; the insert-exhaustion check only runs at the
+    // START of the update phase, so the round whose update would be the 21st
+    // (out of range) still runs its search first before breaking — 21 mixed
+    // searches, not 20. Plus 5 more from the post-insert recall verification
+    // pass = 26 total.
+    let output = Command::new(&bin)
+        .args([
+            "--engines",
+            "test-redis-insert",
+            "--datasets",
+            "test-insert",
+            "--host",
+            "localhost",
+            "--update-search-ratio",
+            "1:1",
+            "--insert",
+            "--repetitions",
+            "1",
+        ])
+        .env("REDIS_PORT", TEST_PORT.to_string())
+        .current_dir(&project_root)
+        .output()
+        .expect("Failed to run vector-db-benchmark");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "Binary failed.\nstdout: {}\nstderr: {}",
+        stdout,
+        stderr
+    );
+
+    assert!(
+        stdout.contains("Post-insert recall (allneighbors)"),
+        "Expected the post-insert recall phase to run.\nstdout: {}",
+        stdout,
+    );
+
+    let ft_search_calls = commandstats_calls(&mut conn, "FT.SEARCH");
+    assert_eq!(
+        ft_search_calls, 26,
+        "Expected 26 FT.SEARCH calls (21 mixed + 5 post-insert recall), got {}",
+        ft_search_calls
+    );
+
+    let hset_calls = commandstats_calls(&mut conn, "hset");
+    assert_eq!(
+        hset_calls,
+        (train_count + insert_count) as u64,
+        "Expected {} HSET calls (upload + inserts), got {}",
+        train_count + insert_count,
+        hset_calls
+    );
+
+    let results_dir = project_root.join("results");
+    let mean_recall =
+        read_search_result_field(&results_dir, "test-redis-insert", "post_insert_mean_recall")
+            .and_then(|v| v.as_f64())
+            .expect("post_insert_mean_recall missing from results JSON");
+    assert!(
+        mean_recall >= 0.8,
+        "post-insert recall too low: {}",
+        mean_recall
+    );
+
+    let p10 = read_search_result_field(&results_dir, "test-redis-insert", "post_insert_recall_p10");
+    assert!(
+        p10.is_some(),
+        "post_insert_recall_p10 missing from results JSON"
+    );
+
+    fs::remove_dir_all(&project_root).ok();
+}
