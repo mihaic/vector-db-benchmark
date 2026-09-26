@@ -42,8 +42,11 @@ pub struct RedisEngineConfig {
     /// Ignored for non-SVS algorithms.
     pub svs_graph_max_degree: Option<i64>,
     pub svs_construction_window_size: Option<i64>,
-    pub svs_compression: Option<String>,
     pub svs_reduce: Option<i64>,
+    /// Vector `COMPRESSION` (e.g. `SQ8`, `LeanVec4x8`). For SVS, resolved from
+    /// `svs-vamana_config.compression` > `REDIS_SVS_COMPRESSION`; for HNSW, from
+    /// `hnsw_config.COMPRESSION`. `None` → no COMPRESSION attribute.
+    pub compression: Option<String>,
     /// Per-config RediSearch index name (`"<base>:<config>"`, issue #151-4) so a
     /// sweep's configs address disjoint indexes on one server. Resolved once in
     /// `new()`; never re-read from the environment inside a timed window.
@@ -129,10 +132,11 @@ impl RedisEngine {
         let redis_url = crate::engine::build_redis_url(host);
 
         // Extract HNSW config
-        let (m, ef_construction) = engine_config
+        let hnsw_config = engine_config
             .collection_params
             .as_ref()
-            .and_then(|cp| cp.hnsw_config.as_ref())
+            .and_then(|cp| cp.hnsw_config.as_ref());
+        let (m, ef_construction) = hnsw_config
             .map(|h| (h.m.unwrap_or(16), h.ef_construction.unwrap_or(128)))
             .unwrap_or((16, 128));
 
@@ -209,6 +213,14 @@ impl RedisEngine {
             } else {
                 (None, None, None, None)
             };
+        let compression = if is_svs(&algorithm) {
+            svs_compression
+        } else {
+            hnsw_config
+                .and_then(|h| h.compression.as_deref())
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+        };
 
         let parallel = engine_config
             .upload_params
@@ -237,8 +249,8 @@ impl RedisEngine {
                 skip_vector_index: engine_config.skip_vector_index,
                 svs_graph_max_degree,
                 svs_construction_window_size,
-                svs_compression,
                 svs_reduce,
+                compression,
                 index_name: derive_index_name("REDIS_INDEX_NAME", "idx", &engine_config.name),
                 // Shared-corpus mode (#188): REDIS_KEY_PREFIX overrides the
                 // per-config prefix with ONE shared prefix across all sweep
@@ -326,7 +338,7 @@ impl RedisEngine {
                     .config
                     .svs_construction_window_size
                     .unwrap_or(self.config.ef_construction);
-                let compression = self.config.svs_compression.clone();
+                let compression = self.config.compression.clone();
                 let mut reduce = self.config.svs_reduce;
                 // REDUCE is only valid with a LeanVec COMPRESSION; emitting it
                 // otherwise builds an index RediSearch rejects. Drop it (with a
@@ -362,14 +374,25 @@ impl RedisEngine {
                     cmd.arg("REDUCE").arg(r);
                 }
             } else {
-                // HNSW (default): TYPE+DIM+DISTANCE_METRIC + M + EF_CONSTRUCTION.
-                let num_attrs = 6 + 2 + 2;
+                // HNSW (default): TYPE+DIM+DISTANCE_METRIC + M + EF_CONSTRUCTION,
+                // + COMPRESSION (2) when configured.
+                let num_attrs = 6
+                    + 2
+                    + 2
+                    + if self.config.compression.is_some() {
+                        2
+                    } else {
+                        0
+                    };
                 cmd.arg(num_attrs);
                 cmd.arg("TYPE").arg(&self.config.data_type);
                 cmd.arg("DIM").arg(vector_size);
                 cmd.arg("DISTANCE_METRIC").arg(distance_metric);
                 cmd.arg("M").arg(self.config.m);
                 cmd.arg("EF_CONSTRUCTION").arg(self.config.ef_construction);
+                if let Some(ref c) = self.config.compression {
+                    cmd.arg("COMPRESSION").arg(c);
+                }
             }
         }
 
@@ -3218,8 +3241,8 @@ mod tests {
             skip_vector_index: false,
             svs_graph_max_degree: None,
             svs_construction_window_size: None,
-            svs_compression: None,
             svs_reduce: None,
+            compression: None,
             index_name: "idx:test".to_string(),
             key_prefix: "test:".to_string(),
             shared_corpus: false,
@@ -3275,7 +3298,7 @@ mod tests {
         assert_eq!(c.data_type, "FLOAT16", "nested data_type resolved");
         assert_eq!(c.svs_graph_max_degree, Some(40));
         assert_eq!(c.svs_construction_window_size, Some(250));
-        assert_eq!(c.svs_compression.as_deref(), Some("LeanVec4x8"));
+        assert_eq!(c.compression.as_deref(), Some("LeanVec4x8"));
         assert_eq!(c.svs_reduce, Some(384));
     }
 
@@ -3295,8 +3318,26 @@ mod tests {
         assert_eq!(c.algorithm, "hnsw");
         assert_eq!(c.m, 32);
         assert_eq!(c.svs_graph_max_degree, None);
-        assert_eq!(c.svs_compression, None);
+        assert_eq!(c.compression, None);
         assert_eq!(c.svs_reduce, None);
+    }
+
+    // HNSW COMPRESSION comes from hnsw_config (either key case).
+    #[test]
+    fn hnsw_config_resolves_compression() {
+        use super::RedisEngine;
+        let cfg_json = serde_json::json!({
+            "name": "redis-hnsw-sq8",
+            "engine": "redis",
+            "collection_params": {
+                "algorithm": "hnsw",
+                "hnsw_config": { "M": 32, "EF_CONSTRUCTION": 200, "compression": "SQ8" }
+            }
+        });
+        let ec: crate::config::EngineConfig = serde_json::from_value(cfg_json).unwrap();
+        let c = RedisEngine::new(&ec, "localhost").unwrap().config;
+        assert_eq!(c.algorithm, "hnsw");
+        assert_eq!(c.compression.as_deref(), Some("SQ8"));
     }
 
     #[test]

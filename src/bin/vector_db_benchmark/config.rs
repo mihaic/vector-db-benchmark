@@ -33,6 +33,10 @@ pub struct HnswConfig {
         alias = "ef_construction"
     )]
     pub ef_construction: Option<i64>,
+    /// Vector compression (e.g. `SQ8`), passed as HNSW `COMPRESSION` by the
+    /// Redis engine.
+    #[serde(rename = "COMPRESSION", alias = "compression")]
+    pub compression: Option<String>,
 }
 
 /// Elasticsearch index_options (lowercase keys)

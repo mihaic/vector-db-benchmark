@@ -30,6 +30,37 @@
     }
   },
   {
+    "name": "dbpedia-cal-hnswsq8-float16",
+    "engine": "redis",
+    "connection_params": {},
+    "collection_params": {
+      "algorithm": "hnsw",
+      "data_type": "FLOAT16",
+      "hnsw_config": {
+        "M": 16,
+        "DISTANCE_METRIC": "IP",
+        "EF_CONSTRUCTION": 200,
+        "compression": "SQ8"
+      }
+    },
+    "search_params": [
+      {
+        "parallel": 100,
+        "top": 100,
+        "calibration_param": "ef",
+        "calibration_precision": 0.95,
+        "search_params": {
+          "data_type": "FLOAT16"
+        }
+      }
+    ],
+    "upload_params": {
+      "parallel": 100,
+      "algorithm": "hnsw",
+      "data_type": "FLOAT16"
+    }
+  },
+  {
     "name": "dbpedia-cal-hnsw-float32",
     "engine": "redis",
     "connection_params": {},
