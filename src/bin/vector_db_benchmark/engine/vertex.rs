@@ -1511,6 +1511,7 @@ impl Engine for VertexEngine {
             return Ok(UploadStats {
                 upload_time,
                 total_time: read_time + upload_time,
+                drain_time: None,
                 upload_count: vectors.len(),
                 // Batch ingest is a single index-rebuild operation, not a
                 // parallel-worker stream, so parallel/batch_size describe the
@@ -1705,6 +1706,7 @@ impl Engine for VertexEngine {
         Ok(UploadStats {
             upload_time,
             total_time: read_time + upload_time,
+            drain_time: None,
             upload_count: vectors.len(),
             parallel: workers,
             batch_size: self.batch_size,

@@ -51,6 +51,10 @@ pub use weaviate::WeaviateEngine;
 pub struct UploadStats {
     pub upload_time: f64,
     pub total_time: f64,
+    /// Time spent after indexing reports complete, waiting for a tiered index's
+    /// flat buffer to drain into its backend (included in `total_time`). `None`
+    /// for engines without a flat buffer.
+    pub drain_time: Option<f64>,
     pub upload_count: usize,
     pub parallel: usize,
     pub batch_size: usize,

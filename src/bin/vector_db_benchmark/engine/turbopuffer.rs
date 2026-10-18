@@ -483,6 +483,7 @@ impl Engine for TurbopufferEngine {
         Ok(UploadStats {
             upload_time,
             total_time,
+            drain_time: None,
             upload_count: total,
             parallel: self.parallel,
             batch_size: self.batch_size,

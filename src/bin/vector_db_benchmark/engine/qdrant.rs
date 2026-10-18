@@ -436,6 +436,7 @@ impl QdrantEngine {
         Ok(UploadStats {
             upload_time,
             total_time: read_time + upload_time + index_time,
+            drain_time: None,
             upload_count: ids.len(),
             parallel: 1,
             batch_size: self.batch_size,
@@ -495,6 +496,7 @@ impl QdrantEngine {
         Ok(UploadStats {
             upload_time,
             total_time: read_time + upload_time + index_time,
+            drain_time: None,
             upload_count: vectors.len(),
             parallel: 1,
             batch_size: self.batch_size,
@@ -1059,6 +1061,7 @@ impl Engine for QdrantEngine {
         Ok(UploadStats {
             upload_time,
             total_time,
+            drain_time: None,
             upload_count: vectors.len(),
             parallel: self.parallel,
             batch_size: self.batch_size,

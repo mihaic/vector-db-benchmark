@@ -952,6 +952,7 @@ impl Engine for MilvusEngine {
         Ok(UploadStats {
             upload_time,
             total_time,
+            drain_time: None,
             upload_count: vectors.len(),
             parallel: self.parallel,
             batch_size: self.batch_size,

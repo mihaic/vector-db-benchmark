@@ -873,6 +873,7 @@ impl Engine for ElasticsearchEngine {
         Ok(UploadStats {
             upload_time,
             total_time,
+            drain_time: None,
             upload_count: vectors.len(),
             parallel: self.config.parallel,
             batch_size: self.config.batch_size,

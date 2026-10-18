@@ -741,6 +741,66 @@ impl RedisEngine {
         }
     }
 
+    /// Wait until a tiered index's flat buffer drains to its bound, i.e. the
+    /// backend graph has caught up with the upload. `wait_for_indexing` cannot
+    /// see this: num_docs/percent_indexed count a vector once it is in the flat
+    /// buffer, and a tiered SVS index buffers without bound while its backend
+    /// initializes. Returns the time spent waiting, or `None` when FT.INFO
+    /// reports no flat buffer.
+    fn wait_for_flat_buffer_drain(&self) -> Result<Option<f64>, String> {
+        // RediSearch's default `search-tiered-hnsw-buffer-limit`.
+        const DEFAULT_BUFFER_LIMIT: usize = 1024;
+        let max_wait = 3600; // seconds
+        let start = Instant::now();
+        let limit =
+            redis_utils::tiered_buffer_limit(&mut self.get_connection()?).unwrap_or_else(|| {
+                println!(
+                    "Warning: tiered buffer limit not reported; assuming {}",
+                    DEFAULT_BUFFER_LIMIT
+                );
+                DEFAULT_BUFFER_LIMIT
+            });
+        let mut last_report = 0;
+
+        loop {
+            let info = self
+                .ft_info_best_effort()
+                .ok_or("FT.INFO failed while waiting for the flat buffer to drain")?;
+            let Some(flat_buffer_size) = redis_utils::ft_info_flat_buffer_size(&info) else {
+                return Ok(None);
+            };
+            let elapsed = start.elapsed();
+
+            if flat_buffer_size <= limit {
+                println!(
+                    "Flat buffer drained: {} <= {} in {:.1}s",
+                    flat_buffer_size,
+                    limit,
+                    elapsed.as_secs_f64()
+                );
+                return Ok(Some(elapsed.as_secs_f64()));
+            }
+
+            if elapsed.as_secs() > max_wait {
+                println!(
+                    "Warning: flat buffer drain timeout after {}s (flat_buffer_size={}, limit={})",
+                    max_wait, flat_buffer_size, limit
+                );
+                return Ok(Some(elapsed.as_secs_f64()));
+            }
+
+            if elapsed.as_secs() >= last_report + 10 {
+                last_report = elapsed.as_secs();
+                println!(
+                    "  draining flat buffer... flat_buffer_size={}, limit={}",
+                    flat_buffer_size, limit
+                );
+            }
+
+            std::thread::sleep(std::time::Duration::from_millis(500));
+        }
+    }
+
     /// Best-effort FT.INFO for stat collection: reconnect + retry through a few
     /// transient server blips (#198), then give up (`None`) rather than fail —
     /// memory/index telemetry is non-critical, so a persistent error degrades to
@@ -2075,6 +2135,7 @@ impl Engine for RedisEngine {
                     return Ok(UploadStats {
                         upload_time: 0.0,
                         total_time: 0.0,
+                        drain_time: None,
                         upload_count: existing,
                         parallel: self.config.parallel,
                         batch_size: self.config.batch_size,
@@ -2129,11 +2190,15 @@ impl Engine for RedisEngine {
         let index_start = Instant::now();
         self.wait_for_indexing(expected)?;
         let index_time = index_start.elapsed().as_secs_f64();
+        // The backend's catch-up on the flat buffer is ingest cost as well.
+        let drain_time = self.wait_for_flat_buffer_drain()?;
 
-        let total_time = read_time + upload_time + index_time;
+        let total_time = read_time + upload_time + index_time + drain_time.unwrap_or(0.0);
         println!(
-            "Index time: {:.3}s, Total time (read+upload+index): {:.3}s",
-            index_time, total_time
+            "Index time: {:.3}s, Drain time: {:.3}s, Total time (read+upload+index+drain): {:.3}s",
+            index_time,
+            drain_time.unwrap_or(0.0),
+            total_time
         );
 
         // Verify no HSET failures occurred during upload
@@ -2148,6 +2213,7 @@ impl Engine for RedisEngine {
         Ok(UploadStats {
             upload_time,
             total_time,
+            drain_time,
             upload_count: vectors.len(),
             parallel: self.config.parallel,
             batch_size: self.config.batch_size,

@@ -1254,6 +1254,7 @@ fn save_upload_results(
         "results": {
             "upload_time": stats.upload_time,
             "total_time": stats.total_time,
+            "drain_time": stats.drain_time,
             "upload_count": stats.upload_count,
             "memory_usage": stats.memory_usage,
         }

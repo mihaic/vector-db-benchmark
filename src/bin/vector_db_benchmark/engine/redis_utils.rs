@@ -382,17 +382,9 @@ pub fn ensure_index_exists(conn: &mut Connection, index_name: &str) -> Result<()
 /// configs, so it cannot attribute memory per graph; this reads the per-index
 /// figure instead. Returns `None` when the reply carries no size fields.
 pub fn ft_info_index_memory_bytes(v: &redis::Value) -> Option<i64> {
-    let pairs: Vec<(String, &redis::Value)> = match v {
-        redis::Value::Map(m) => m.iter().map(|(k, val)| (value_to_string(k), val)).collect(),
-        redis::Value::Array(items) => items
-            .chunks_exact(2)
-            .map(|c| (value_to_string(&c[0]), &c[1]))
-            .collect(),
-        _ => return None,
-    };
     let mut mb = 0.0f64;
     let mut found = false;
-    for (k, val) in pairs {
+    for (k, val) in kv_pairs(v) {
         if k.ends_with("_mb") {
             if let Ok(n) = value_to_string(val).parse::<f64>() {
                 mb += n;
@@ -401,6 +393,68 @@ pub fn ft_info_index_memory_bytes(v: &redis::Value) -> Option<i64> {
         }
     }
     found.then_some((mb * 1024.0 * 1024.0) as i64)
+}
+
+/// Total `flat_buffer_size` over the `field statistics` of an `FT.INFO` reply
+/// (RESP2 flat array or RESP3 map): vectors a tiered index (HNSW or SVS) has
+/// accepted but not yet moved into its backend graph. `None` when no field
+/// reports it (non-tiered index, or a server that predates the stat).
+pub fn ft_info_flat_buffer_size(v: &redis::Value) -> Option<usize> {
+    let (_, stats) = kv_pairs(v)
+        .into_iter()
+        .find(|(k, _)| k == "field statistics")?;
+    let redis::Value::Array(fields) = stats else {
+        return None;
+    };
+    let mut total = 0;
+    let mut found = false;
+    for field in fields {
+        for (k, val) in kv_pairs(field) {
+            if k == "flat_buffer_size" {
+                if let Ok(n) = value_to_string(val).parse::<usize>() {
+                    total += n;
+                    found = true;
+                }
+            }
+        }
+    }
+    found.then_some(total)
+}
+
+/// The tiered-index flat buffer bound, which RediSearch passes to both HNSW and
+/// SVS tiered indexes: `search-tiered-hnsw-buffer-limit` via `CONFIG GET`, or
+/// `TIERED_HNSW_BUFFER_LIMIT` via `FT.CONFIG GET` on servers without module
+/// config. `None` when neither reports it.
+pub fn tiered_buffer_limit(conn: &mut Connection) -> Option<usize> {
+    let lookups = [
+        ("CONFIG", "search-tiered-hnsw-buffer-limit"),
+        ("FT.CONFIG", "TIERED_HNSW_BUFFER_LIMIT"),
+    ];
+    lookups.iter().find_map(|(cmd, name)| {
+        let val = redis::cmd(cmd)
+            .arg("GET")
+            .arg(name)
+            .query::<redis::Value>(conn)
+            .ok()?;
+        match parse_kv_map(&val).get(name)? {
+            Json::String(s) => s.parse().ok(),
+            Json::Number(n) => n.as_u64().map(|n| n as usize),
+            _ => None,
+        }
+    })
+}
+
+/// Key/value pairs of a RESP2 flat `[k, v, ...]` array or a RESP3 map; empty
+/// for any other reply shape.
+fn kv_pairs(v: &redis::Value) -> Vec<(String, &redis::Value)> {
+    match v {
+        redis::Value::Map(m) => m.iter().map(|(k, val)| (value_to_string(k), val)).collect(),
+        redis::Value::Array(items) => items
+            .chunks_exact(2)
+            .map(|c| (value_to_string(&c[0]), &c[1]))
+            .collect(),
+        _ => Vec::new(),
+    }
 }
 
 /// Non-destructive teardown for a single config's index + keys (issue #151-4),
@@ -562,6 +616,51 @@ mod tests {
         // No size fields → None.
         assert_eq!(
             super::ft_info_index_memory_bytes(&Value::Array(vec![bulk("num_docs"), bulk("5")])),
+            None
+        );
+    }
+
+    #[test]
+    fn ft_info_flat_buffer_size_sums_field_statistics_from_both_shapes() {
+        use redis::Value;
+        fn bulk(s: &str) -> Value {
+            Value::BulkString(s.as_bytes().to_vec())
+        }
+        // RESP2: flat top-level array, each field a flat array; a non-vector
+        // field without the stat is skipped.
+        let arr = Value::Array(vec![
+            bulk("num_docs"),
+            Value::Int(900000),
+            bulk("field statistics"),
+            Value::Array(vec![
+                Value::Array(vec![
+                    bulk("identifier"),
+                    bulk("vector"),
+                    bulk("flat_buffer_size"),
+                    Value::Int(889349),
+                ]),
+                Value::Array(vec![bulk("identifier"), bulk("tag")]),
+                Value::Array(vec![bulk("flat_buffer_size"), Value::Int(1)]),
+            ]),
+        ]);
+        assert_eq!(super::ft_info_flat_buffer_size(&arr), Some(889350));
+        // RESP3: top-level map, each field a map.
+        let map = Value::Map(vec![(
+            bulk("field statistics"),
+            Value::Array(vec![Value::Map(vec![(
+                bulk("flat_buffer_size"),
+                Value::Int(738),
+            )])]),
+        )]);
+        assert_eq!(super::ft_info_flat_buffer_size(&map), Some(738));
+        // No field reports the stat, or no field statistics at all → None.
+        let no_stat = Value::Array(vec![
+            bulk("field statistics"),
+            Value::Array(vec![Value::Array(vec![bulk("identifier"), bulk("tag")])]),
+        ]);
+        assert_eq!(super::ft_info_flat_buffer_size(&no_stat), None);
+        assert_eq!(
+            super::ft_info_flat_buffer_size(&Value::Array(vec![bulk("num_docs"), bulk("5")])),
             None
         );
     }
