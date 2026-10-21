@@ -1,8 +1,19 @@
 //! PgVector engine implementation.
 //!
 //! Uses the `postgres` crate for PostgreSQL connectivity with the pgvector extension.
-//! Supports HNSW index with configurable m/ef_construction, COPY bulk upload,
-//! and distance operators <-> (L2) and <=> (cosine).
+//! Supports two vector indexes, selected by `algorithm` (top-level or in
+//! `collection_params`):
+//! - `hnsw` (default): pgvector HNSW with configurable m/ef_construction.
+//! - `svs-vamana`: SVS Vamana from the `svs` extension, configured by the
+//!   `collection_params.svs-vamana_config` block (passed through as index
+//!   `WITH (...)` options) and searched with `svs.search_window_size`.
+//!   Options use the extension's encoding, e.g. `alpha` as an integer x100 and
+//!   `compression_type` 0 = none, 1 = LeanVec, 2 = LVQ. The server needs `svs`
+//!   in `shared_preload_libraries`, `wal_level = logical`, and the database
+//!   enrolled in `vamana_databases` (see tests/pgsvs-server.sh).
+//!
+//! COPY bulk upload, distance operators <-> (L2), <=> (cosine) and <#> (inner
+//! product), and the mixed search+update / `--insert` workload (upserts by id).
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -10,10 +21,12 @@ use std::time::Instant;
 
 use indicatif::{HumanCount, ProgressBar, ProgressState, ProgressStyle};
 use postgres::types::ToSql;
+use rand::seq::SliceRandom;
+use rand::SeedableRng;
 
 use crate::config::{EngineConfig, SearchParams};
 use crate::dataset::Dataset;
-use crate::engine::{Engine, SearchResults, UploadStats};
+use crate::engine::{closed_loop_duration, Engine, SearchResults, UpdateSearchRatio, UploadStats};
 use vector_db_benchmark::readers::metadata::{
     is_multivalued_keyword_field, MetadataItem, MetadataValue,
 };
@@ -67,6 +80,85 @@ fn copy_field(meta: Option<&MetadataItem>, column: &str) -> String {
     }
 }
 
+/// `collection_params` key holding the SVS Vamana build options (same key as
+/// the Redis SVS configs).
+const SVS_CONFIG_KEY: &str = "svs-vamana_config";
+
+/// `collection_params` keys for index build session settings (both indexes).
+const BUILD_MAINTENANCE_WORK_MEM: &str = "maintenance_work_mem";
+const BUILD_MAX_PARALLEL_WORKERS: &str = "max_parallel_workers";
+
+/// Vector index built on `items.embedding`.
+#[derive(Debug, Clone, PartialEq)]
+enum PgIndex {
+    /// pgvector HNSW. Created on the empty table in `configure` and filled
+    /// incrementally by the COPY upload, unless `index_after_load` is set.
+    Hnsw { m: i64, ef_construction: i64 },
+    /// SVS Vamana, always built in one pass over the loaded table at the end
+    /// of `upload` (graph construction over the full corpus).
+    Vamana(VamanaConfig),
+}
+
+#[derive(Debug, Clone, Default, PartialEq)]
+struct VamanaConfig {
+    /// `WITH (...)` index options as `(name, SQL literal)`. Keys absent from the
+    /// config are omitted so the extension's defaults apply.
+    with_options: Vec<(String, String)>,
+}
+
+/// Session settings applied before an index build after the load.
+#[derive(Debug, Clone, Default, PartialEq)]
+struct BuildSettings {
+    /// `maintenance_work_mem`, as a SQL literal. pgvector HNSW builds much
+    /// faster when the graph fits; SVS does not use it yet.
+    maintenance_work_mem: Option<String>,
+    /// Parallel build workers (`max_parallel_maintenance_workers` and the
+    /// table's `parallel_workers`). The pool itself, `max_parallel_workers`,
+    /// is left to the server: SVS keeps its search threads parked in it.
+    max_parallel_workers: Option<u64>,
+}
+
+/// Storage type of `items.embedding`, from `data_type` (`FLOAT32`, the
+/// default, or `FLOAT16`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum VectorType {
+    Vector,
+    HalfVec,
+}
+
+impl VectorType {
+    fn sql_type(self) -> &'static str {
+        match self {
+            VectorType::Vector => "vector",
+            VectorType::HalfVec => "halfvec",
+        }
+    }
+
+    /// Bound parameter `$n`, sent as a `vector` and cast to the column type.
+    fn param(self, n: usize) -> String {
+        match self {
+            VectorType::Vector => format!("${}", n),
+            VectorType::HalfVec => format!("${}::vector::halfvec", n),
+        }
+    }
+
+    /// Ops class for this type from a `vector_*_ops` class.
+    fn ops_class(self, vector_ops: &str) -> String {
+        vector_ops.replacen("vector", self.sql_type(), 1)
+    }
+}
+
+/// Re-upserts an existing point or inserts a new one during the mixed workload.
+/// Only the embedding is written: re-upserted points keep their payload, and
+/// `--insert` vectors carry none (their payload columns stay NULL).
+fn upsert_sql(vector_type: VectorType) -> String {
+    format!(
+        "INSERT INTO items (id, embedding) VALUES ($1, {}) \
+         ON CONFLICT (id) DO UPDATE SET embedding = EXCLUDED.embedding",
+        vector_type.param(2)
+    )
+}
+
 pub struct PgVectorEngine {
     name: String,
     host: String,
@@ -74,13 +166,20 @@ pub struct PgVectorEngine {
     dbname: String,
     user: String,
     password: String,
-    m: i64,
-    ef_construction: i64,
+    index: PgIndex,
+    /// Build the index after the COPY load rather than before (always for
+    /// Vamana; `collection_params.index_after_load` for HNSW).
+    index_after_load: bool,
+    build: BuildSettings,
+    vector_type: VectorType,
+    /// `collection_params.distance`: index with this metric instead of the
+    /// dataset's. Only valid for cosine datasets, whose vectors and queries
+    /// are normalized on read, so `l2` and `dot` rank identically to cosine.
+    /// `normalize_cosine: true` is shorthand for `distance: l2`.
+    distance: Option<String>,
     batch_size: usize,
     parallel: usize,
     search_params: Vec<SearchParams>,
-    distance_op: String,
-    hnsw_ops_class: String,
     /// Payload columns (name, pg type) derived from the dataset schema, set in
     /// `configure` and written by `upload` so filtered queries have real columns.
     schema_columns: Vec<(String, String)>,
@@ -97,13 +196,43 @@ impl PgVectorEngine {
         let user = std::env::var("PGVECTOR_USER").unwrap_or_else(|_| "postgres".to_string());
         let password = std::env::var("PGVECTOR_PASSWORD").unwrap_or_else(|_| "passwd".to_string());
 
-        // Extract HNSW config
-        let (m, ef_construction) = engine_config
+        let index = parse_pg_index(engine_config)?;
+        let cp_extra = engine_config
             .collection_params
             .as_ref()
-            .and_then(|cp| cp.hnsw_config.as_ref())
-            .map(|h| (h.m.unwrap_or(16), h.ef_construction.unwrap_or(128)))
-            .unwrap_or((16, 128));
+            .and_then(|cp| cp.extra.as_ref());
+        let cp_bool = |key: &str| {
+            cp_extra
+                .and_then(|e| e.get(key))
+                .map(|v| {
+                    v.as_bool()
+                        .ok_or_else(|| format!("{} must be a boolean, got {}", key, v))
+                })
+                .transpose()
+        };
+        let index_after_load =
+            matches!(index, PgIndex::Vamana(_)) || cp_bool("index_after_load")?.unwrap_or(false);
+        let build = parse_build_settings(cp_extra)?;
+        let vector_type = parse_vector_type(engine_config)?;
+
+        let distance = cp_extra
+            .and_then(|e| e.get("distance"))
+            .map(|v| {
+                v.as_str()
+                    .map(str::to_lowercase)
+                    .ok_or_else(|| format!("distance must be a string, got {}", v))
+            })
+            .transpose()?;
+        if let Some(d) = &distance {
+            map_pg_distance_ops(d)?;
+        }
+        let distance = match (cp_bool("normalize_cosine")?.unwrap_or(false), distance) {
+            (false, d) => d,
+            (true, None) => Some("l2".to_string()),
+            (true, Some(_)) => {
+                return Err("set either normalize_cosine or distance, not both".to_string())
+            }
+        };
 
         let parallel = engine_config
             .upload_params
@@ -126,16 +255,49 @@ impl PgVectorEngine {
             dbname,
             user,
             password,
-            m,
-            ef_construction,
+            index,
+            index_after_load,
+            build,
+            vector_type,
+            distance,
             batch_size,
             parallel,
             search_params: engine_config.search_params.clone().unwrap_or_default(),
-            // Default: will be set during configure based on dataset distance
-            distance_op: String::new(),
-            hnsw_ops_class: String::new(),
             schema_columns: Vec::new(),
         })
+    }
+
+    /// `(operator, ops class)` for the indexed distance. Resolved per call
+    /// rather than cached in `configure`, which `--skip-upload` runs skip.
+    fn distance_ops(&self, dataset: &Dataset) -> Result<(&'static str, String), String> {
+        let dataset_ops = map_pg_distance_ops(dataset.distance())?;
+        let (op, vector_ops) = match self.distance.as_deref() {
+            None => dataset_ops,
+            Some(d) => {
+                let ops = map_pg_distance_ops(d)?;
+                if ops != dataset_ops && !dataset.needs_normalization() {
+                    return Err(format!(
+                        "distance '{}' differs from the dataset's '{}', which ranks \
+                         differently unless vectors are normalized (cosine datasets only)",
+                        d,
+                        dataset.distance()
+                    ));
+                }
+                ops
+            }
+        };
+        Ok((op, self.vector_type.ops_class(vector_ops)))
+    }
+
+    /// `CREATE INDEX` statement for the configured index.
+    fn index_sql(&self, ops_class: &str) -> String {
+        match &self.index {
+            PgIndex::Hnsw { m, ef_construction } => format!(
+                "CREATE INDEX ON items USING hnsw(embedding {}) WITH (m = {}, ef_construction = {})",
+                ops_class, m, ef_construction
+            ),
+            PgIndex::Vamana(cfg) => vamana_index_sql(ops_class, cfg),
+        }
     }
 
     fn connection_string(&self) -> String {
@@ -163,6 +325,126 @@ impl PgVectorEngine {
         );
         pb
     }
+
+    /// Recall of one pass over every query against `allneighbors`, after a
+    /// `--insert` run. Returns `(mean, p10, per-query recalls)`.
+    #[allow(clippy::too_many_arguments)]
+    fn post_insert_recall(
+        &self,
+        dataset: &Dataset,
+        queries: &[Vec<f32>],
+        parsed_filters: &[Option<(String, Vec<PgValue>)>],
+        explicit_top: Option<usize>,
+        knob: Option<i64>,
+        distance_op: &str,
+        parallel: usize,
+    ) -> Result<(f64, f64, Vec<f64>), String> {
+        let all_neighbors = dataset.read_all_neighbors()?;
+        if all_neighbors.len() < queries.len() {
+            return Err(format!(
+                "allneighbors has {} rows, fewer than the {} queries",
+                all_neighbors.len(),
+                queries.len()
+            ));
+        }
+        println!(
+            "\tVerifying recall against the full post-insert corpus ({} queries)...",
+            queries.len()
+        );
+
+        let query_idx = Arc::new(AtomicUsize::new(0));
+        let conn_str = self.connection_string();
+        let index = &self.index;
+        let vector_type = self.vector_type;
+        let pb = self.create_progress_bar(queries.len());
+        let mut recalls: Vec<f64> = Vec::with_capacity(queries.len());
+
+        std::thread::scope(|s| {
+            let mut handles = Vec::with_capacity(parallel.max(1));
+            for _ in 0..parallel.max(1) {
+                let conn_str = conn_str.clone();
+                let all_neighbors = &all_neighbors;
+                let query_idx = Arc::clone(&query_idx);
+                let pb = &pb;
+
+                handles.push(s.spawn(move || {
+                    let mut local: Vec<f64> = Vec::new();
+                    let mut conn = match postgres::Client::connect(&conn_str, postgres::NoTls) {
+                        Ok(c) => c,
+                        Err(_) => return local,
+                    };
+                    if let Err(e) = apply_search_session(&mut conn, index, knob) {
+                        eprintln!("{}", e);
+                        return local;
+                    }
+                    loop {
+                        let idx = query_idx.fetch_add(1, Ordering::Relaxed);
+                        if idx >= queries.len() {
+                            break;
+                        }
+                        let top = explicit_top.unwrap_or_else(|| {
+                            let n = all_neighbors[idx].len();
+                            if n > 0 {
+                                n
+                            } else {
+                                10
+                            }
+                        });
+                        let (results, _) = knn_query(
+                            &mut conn,
+                            distance_op,
+                            vector_type,
+                            &queries[idx],
+                            top,
+                            parsed_filters[idx].as_ref(),
+                        );
+                        match results {
+                            Ok(ordered_ids) => {
+                                let m = crate::metrics::compute_metrics(
+                                    &ordered_ids,
+                                    &all_neighbors[idx],
+                                    top,
+                                );
+                                local.push(m.recall);
+                            }
+                            Err(e) => {
+                                eprintln!("Post-insert recall query {} failed: {}", idx, e);
+                            }
+                        }
+                        pb.inc(1);
+                    }
+                    local
+                }));
+            }
+            for h in handles {
+                recalls.extend(h.join().unwrap());
+            }
+        });
+        pb.finish_and_clear();
+
+        if recalls.is_empty() {
+            return Err("No post-insert recall queries completed".to_string());
+        }
+        let mean_recall = recalls.iter().sum::<f64>() / recalls.len() as f64;
+        let mut sorted = recalls.clone();
+        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let recall_p10 = crate::engine::percentile_linear(&sorted, 0.10);
+        Ok((mean_recall, recall_p10, recalls))
+    }
+}
+
+/// Per-thread samples of the mixed workload, merged on join.
+#[derive(Default)]
+struct MixedWorkerSamples {
+    times: Vec<f64>,
+    precs: Vec<f64>,
+    recs: Vec<f64>,
+    mrs: Vec<f64>,
+    nds: Vec<f64>,
+    u_times: Vec<f64>,
+    update_failures: usize,
+    first_update_error: Option<String>,
+    update_retries: usize,
 }
 
 impl Engine for PgVectorEngine {
@@ -175,17 +457,23 @@ impl Engine for PgVectorEngine {
     }
 
     fn configure(&mut self, dataset: &Dataset) -> Result<(), String> {
-        let distance = dataset.distance();
         let vector_size = dataset.vector_size();
-
-        let dist_lower = distance.to_lowercase();
-
-        // Set distance operator and HNSW ops class
-        let (distance_op, hnsw_ops_class) = map_pg_distance_ops(&dist_lower)?;
-        self.distance_op = distance_op.to_string();
-        self.hnsw_ops_class = hnsw_ops_class.to_string();
+        let (_, ops_class) = self.distance_ops(dataset)?;
 
         let mut conn = self.connect()?;
+
+        if matches!(self.index, PgIndex::Vamana(_)) {
+            println!("Checking svs extension...");
+            // A no-op when already installed; creating it needs a superuser.
+            conn.execute("CREATE EXTENSION IF NOT EXISTS svs", &[])
+                .map_err(|e| {
+                    format!(
+                        "svs extension unavailable ({}). Install it and run \
+                         'CREATE EXTENSION svs;' as a PostgreSQL superuser",
+                        pg_error_message(&e)
+                    )
+                })?;
+        }
 
         // Ensure vector extension exists
         println!("Creating vector extension...");
@@ -222,7 +510,11 @@ impl Engine for PgVectorEngine {
         println!("Creating items table (vector dimension {})...", vector_size);
         let mut columns = vec![
             "id SERIAL PRIMARY KEY".to_string(),
-            format!("embedding vector({}) NOT NULL", vector_size),
+            format!(
+                "embedding {}({}) NOT NULL",
+                self.vector_type.sql_type(),
+                vector_size
+            ),
         ];
         for (name, pg_type) in &self.schema_columns {
             columns.push(format!("\"{}\" {}", name, pg_type));
@@ -238,17 +530,14 @@ impl Engine for PgVectorEngine {
         )
         .map_err(|e| format!("Failed to alter storage: {}", e))?;
 
-        // Create HNSW index
-        println!(
-            "Creating HNSW index (m={}, ef_construction={}, ops={})...",
-            self.m, self.ef_construction, self.hnsw_ops_class
-        );
-        let index_sql = format!(
-            "CREATE INDEX ON items USING hnsw(embedding {}) WITH (m = {}, ef_construction = {})",
-            self.hnsw_ops_class, self.m, self.ef_construction
-        );
-        conn.execute(&index_sql, &[])
-            .map_err(|e| format!("Failed to create HNSW index: {}", e))?;
+        if self.index_after_load {
+            println!("Vector index will be built after upload.");
+        } else {
+            let index_sql = self.index_sql(&ops_class);
+            println!("Creating vector index: {}", index_sql);
+            conn.execute(&index_sql, &[])
+                .map_err(|e| format!("Failed to create vector index: {}", pg_error_message(&e)))?;
+        }
 
         println!("PgVector configured successfully.");
 
@@ -376,6 +665,28 @@ impl Engine for PgVectorEngine {
             return Err(e);
         }
 
+        // A build after the load is part of the upload time, as an incremental
+        // build is part of the COPY time.
+        if self.index_after_load {
+            let copy_time = upload_start.elapsed().as_secs_f64();
+            let (_, ops_class) = self.distance_ops(dataset)?;
+            let mut conn = self.connect()?;
+            for stmt in build_session_sql(&self.build) {
+                conn.execute(&stmt, &[])
+                    .map_err(|e| format!("Failed to apply '{}': {}", stmt, pg_error_message(&e)))?;
+            }
+            let index_sql = self.index_sql(&ops_class);
+            println!("Building vector index: {}", index_sql);
+            let build_start = Instant::now();
+            conn.execute(&index_sql, &[])
+                .map_err(|e| format!("Failed to create vector index: {}", pg_error_message(&e)))?;
+            println!(
+                "COPY time: {:.3}s, index build time: {:.3}s",
+                copy_time,
+                build_start.elapsed().as_secs_f64()
+            );
+        }
+
         let upload_time = upload_start.elapsed().as_secs_f64();
         println!(
             "Upload time: {:.3}s ({:.0} records/sec)",
@@ -403,24 +714,21 @@ impl Engine for PgVectorEngine {
         num_queries: i64,
     ) -> Result<SearchResults, String> {
         let parallel = params.parallel.unwrap_or(1) as usize;
-
-        // Extract hnsw_ef from search params
-        let hnsw_ef = params
-            .search_params
-            .as_ref()
-            .and_then(|sp| {
-                sp.ef.or_else(|| {
-                    sp.extra
-                        .as_ref()
-                        .and_then(|e| e.get("hnsw_ef"))
-                        .and_then(|v| v.as_i64())
-                })
-            })
-            .unwrap_or(128);
+        let knob = search_knob(&self.index, params);
+        let (distance_op, _) = self.distance_ops(dataset)?;
+        // Fail the run up front if the session settings are rejected.
+        apply_search_session(&mut self.connect()?, &self.index, knob)?;
 
         let query_path = dataset.get_path()?;
         println!("\tReading queries from {}...", query_path.display());
         let (queries, neighbors, conditions) = dataset.read_queries()?;
+        if queries.is_empty() {
+            return Err("dataset contains no search queries".to_string());
+        }
+        // Duration mode recycles queries, indexing `neighbors` in lock-step.
+        if neighbors.len() < queries.len() {
+            return Err("dataset ground-truth shorter than query set".into());
+        }
 
         // Parse each query's filter ONCE (outside the timed region) into a
         // parameterized template + a list of typed values to bind. The template
@@ -433,7 +741,11 @@ impl Engine for PgVectorEngine {
             .collect();
 
         let explicit_top: Option<usize> = params.top.map(|t| t as usize);
-        let num_to_run = if num_queries > 0 {
+        // `--search-duration`: run until the deadline, recycling queries.
+        let closed_loop_duration = closed_loop_duration(params)?;
+        let num_to_run = if closed_loop_duration.is_some() {
+            usize::MAX
+        } else if num_queries > 0 {
             (num_queries as usize).min(queries.len())
         } else {
             queries.len()
@@ -444,9 +756,14 @@ impl Engine for PgVectorEngine {
         // order-independent so results are unchanged; work counter uses Relaxed.
         let query_idx = Arc::new(AtomicUsize::new(0));
 
-        let pb = self.create_progress_bar(num_to_run);
+        let pb = self.create_progress_bar(if closed_loop_duration.is_some() {
+            0
+        } else {
+            num_to_run
+        });
         let conn_str = self.connection_string();
-        let distance_op = self.distance_op.clone();
+        let index = &self.index;
+        let vector_type = self.vector_type;
 
         // Barrier-synchronized start so per-worker connection setup AND the cold
         // first query fall OUTSIDE the measured window (mirrors redis/vertex).
@@ -459,23 +776,24 @@ impl Engine for PgVectorEngine {
         let go = Arc::new(std::sync::Barrier::new(parallel + 1));
         let start_cell = Arc::new(std::sync::OnceLock::<Instant>::new());
 
-        let mut times: Vec<f64> = Vec::with_capacity(num_to_run);
-        let mut precs: Vec<f64> = Vec::with_capacity(num_to_run);
-        let mut recs: Vec<f64> = Vec::with_capacity(num_to_run);
-        let mut mrr_vals: Vec<f64> = Vec::with_capacity(num_to_run);
-        let mut ndcg_vals: Vec<f64> = Vec::with_capacity(num_to_run);
+        let capacity = num_to_run.min(queries.len());
+        let mut times: Vec<f64> = Vec::with_capacity(capacity);
+        let mut precs: Vec<f64> = Vec::with_capacity(capacity);
+        let mut recs: Vec<f64> = Vec::with_capacity(capacity);
+        let mut mrr_vals: Vec<f64> = Vec::with_capacity(capacity);
+        let mut ndcg_vals: Vec<f64> = Vec::with_capacity(capacity);
 
         std::thread::scope(|s| {
             let mut handles = Vec::with_capacity(parallel);
             for _ in 0..parallel {
                 let conn_str = conn_str.clone();
-                let distance_op = distance_op.clone();
                 let queries = &queries;
                 let neighbors = &neighbors;
                 let parsed_filters = &parsed_filters;
                 let query_idx = Arc::clone(&query_idx);
                 let ready = Arc::clone(&ready);
                 let go = Arc::clone(&go);
+                let start_cell = Arc::clone(&start_cell);
                 let pb = &pb;
 
                 handles.push(s.spawn(move || {
@@ -495,17 +813,12 @@ impl Engine for PgVectorEngine {
                         }
                     };
 
-                    // Set ef_search for this connection
-                    let _ = conn.execute(
-                        &format!("SET hnsw.ef_search = {}", hnsw_ef),
-                        &[],
-                    );
-
-                    // Enable iterative index scans (pgvector >= 0.8) so that
-                    // non-sargable filters (e.g. array contains-any) keep pulling
-                    // from the HNSW index until LIMIT is satisfied in exact order,
-                    // instead of post-filtering a bounded candidate set.
-                    let _ = conn.execute("SET hnsw.iterative_scan = strict_order", &[]);
+                    if let Err(e) = apply_search_session(&mut conn, index, knob) {
+                        eprintln!("{}", e);
+                        ready.wait();
+                        go.wait();
+                        return (t, p, r, mr, nd);
+                    }
 
                     // Prime this connection with ONE discarded query (index 0) so
                     // the cold first round-trip + plan build is not inside the
@@ -514,86 +827,61 @@ impl Engine for PgVectorEngine {
                     if !queries.is_empty() {
                         let prime_top = explicit_top.unwrap_or_else(|| {
                             let n = neighbors[0].len();
-                            if n > 0 { n } else { 10 }
-                        });
-                        let prime_vec = pgvector::Vector::from(queries[0].clone());
-                        let prime_top_param = prime_top as i64;
-                        let prime_filter = parsed_filters[0].as_ref();
-                        let prime_where = prime_filter
-                            .map(|(tmpl, _)| format!(" WHERE {}", tmpl))
-                            .unwrap_or_default();
-                        let prime_sql = format!(
-                            "SELECT id, embedding {} $1 AS _score FROM items{} ORDER BY _score LIMIT $2::bigint",
-                            distance_op, prime_where
-                        );
-                        let mut prime_params: Vec<&(dyn ToSql + Sync)> =
-                            Vec::with_capacity(2 + prime_filter.map(|(_, v)| v.len()).unwrap_or(0));
-                        prime_params.push(&prime_vec);
-                        prime_params.push(&prime_top_param);
-                        if let Some((_, values)) = prime_filter {
-                            for v in values {
-                                prime_params.push(v.as_sql());
+                            if n > 0 {
+                                n
+                            } else {
+                                10
                             }
-                        }
-                        let _ = conn.query(&prime_sql, &prime_params);
+                        });
+                        let _ = knn_query(
+                            &mut conn,
+                            distance_op,
+                            vector_type,
+                            &queries[0],
+                            prime_top,
+                            parsed_filters[0].as_ref(),
+                        );
                     }
 
                     // Signal "connected + primed", then block until the main thread
                     // stamps the shared measurement start and releases everyone.
                     ready.wait();
                     go.wait();
+                    let start_time = *start_cell.get().unwrap();
 
                     loop {
+                        if closed_loop_duration
+                            .map(|duration| Instant::now() >= start_time + duration)
+                            .unwrap_or(false)
+                        {
+                            break;
+                        }
                         let idx = query_idx.fetch_add(1, Ordering::Relaxed);
                         if idx >= num_to_run {
                             break;
                         }
+                        let idx = idx % queries.len();
 
                         let top = explicit_top.unwrap_or_else(|| {
                             let n = neighbors[idx].len();
-                            if n > 0 { n } else { 10 }
+                            if n > 0 {
+                                n
+                            } else {
+                                10
+                            }
                         });
 
-                        let query_vec = pgvector::Vector::from(queries[idx].clone());
-                        // `top` (LIMIT) and every filter value are BOUND params,
-                        // not inlined, so the statement text is stable per filter
-                        // shape and the plan is reused across queries.
-                        let top_param = top as i64;
-
-                        let filter = parsed_filters[idx].as_ref();
-                        let where_clause = filter
-                            .map(|(tmpl, _)| format!(" WHERE {}", tmpl))
-                            .unwrap_or_default();
-
-                        // $1 = query vector, $2 = LIMIT (bigint), $3.. = filter values.
-                        let query_sql = format!(
-                            "SELECT id, embedding {} $1 AS _score FROM items{} ORDER BY _score LIMIT $2::bigint",
-                            distance_op, where_clause
+                        let (results, query_time) = knn_query(
+                            &mut conn,
+                            distance_op,
+                            vector_type,
+                            &queries[idx],
+                            top,
+                            parsed_filters[idx].as_ref(),
                         );
 
-                        let mut query_params: Vec<&(dyn ToSql + Sync)> =
-                            Vec::with_capacity(2 + filter.map(|(_, v)| v.len()).unwrap_or(0));
-                        query_params.push(&query_vec);
-                        query_params.push(&top_param);
-                        if let Some((_, values)) = filter {
-                            for v in values {
-                                query_params.push(v.as_sql());
-                            }
-                        }
-
-                        let query_start = Instant::now();
-                        let results = conn.query(&query_sql, &query_params);
-                        let query_time = query_start.elapsed().as_secs_f64();
-
                         match results {
-                            Ok(rows) => {
-                                let ordered_ids: Vec<i64> = rows
-                                    .iter()
-                                    .map(|row| {
-                                        let id: i32 = row.get(0);
-                                        id as i64
-                                    })
-                                    .collect();
+                            Ok(ordered_ids) => {
                                 let m = crate::metrics::compute_metrics(
                                     &ordered_ids,
                                     &neighbors[idx],
@@ -641,10 +929,328 @@ impl Engine for PgVectorEngine {
             .map(|st| st.elapsed().as_secs_f64())
             .unwrap_or(0.0);
 
+        // Dispatched queries; equals `num_to_run` unless duration-bounded.
+        let attempted_queries = query_idx.load(Ordering::Relaxed).min(num_to_run);
         let top = explicit_top.unwrap_or_else(|| neighbors.first().map(|n| n.len()).unwrap_or(10));
         crate::engine::compute_search_stats(
-            &times, &precs, &recs, &mrr_vals, &ndcg_vals, total_time, top, parallel, num_to_run,
+            &times,
+            &precs,
+            &recs,
+            &mrr_vals,
+            &ndcg_vals,
+            total_time,
+            top,
+            parallel,
+            attempted_queries,
         )
+    }
+
+    fn search_mixed(
+        &mut self,
+        dataset: &Dataset,
+        params: &SearchParams,
+        num_queries: i64,
+        ratio: &UpdateSearchRatio,
+        use_insert: bool,
+    ) -> Result<SearchResults, String> {
+        let parallel = params.parallel.unwrap_or(1) as usize;
+        let knob = search_knob(&self.index, params);
+        let (distance_op, _) = self.distance_ops(dataset)?;
+        apply_search_session(&mut self.connect()?, &self.index, knob)?;
+
+        let query_path = dataset.get_path()?;
+        println!("\tReading queries from {}...", query_path.display());
+        let (queries, neighbors, conditions) = dataset.read_queries()?;
+        if queries.is_empty() {
+            return Err("dataset contains no search queries".to_string());
+        }
+        // Workers index `neighbors[query_pos]` in lock-step with `queries`.
+        if neighbors.len() < queries.len() {
+            return Err("dataset ground-truth shorter than query set".into());
+        }
+        let parsed_filters: Vec<Option<(String, Vec<PgValue>)>> = conditions
+            .iter()
+            .map(|c| c.as_ref().and_then(|v| parse_pg_conditions(v, 3)))
+            .collect();
+
+        // Updates come from the dedicated `insert` set (new points) with
+        // --insert, otherwise from the corpus (re-upserting existing points).
+        let normalize = dataset.needs_normalization();
+        let (upd_ids, upd_vectors, _) = if use_insert {
+            println!("\tReading insert vectors for updates...");
+            dataset.read_insert_vectors(normalize)?
+        } else {
+            println!("\tReading vectors for updates...");
+            dataset.read_vectors(normalize)?
+        };
+        if upd_ids.is_empty() {
+            return Err("dataset contains no vectors to update".to_string());
+        }
+        let mut update_seq: Vec<usize> = (0..upd_ids.len()).collect();
+        update_seq.shuffle(&mut rand::rngs::StdRng::seed_from_u64(42));
+
+        let explicit_top: Option<usize> = params.top.map(|t| t as usize);
+        let closed_loop_duration = closed_loop_duration(params)?;
+        // With --insert the run stops once every insert vector has been used
+        // exactly once; queries recycle until then, as in duration mode.
+        let unbounded = closed_loop_duration.is_some() || use_insert;
+        let num_to_run = if unbounded {
+            usize::MAX
+        } else if num_queries > 0 {
+            (num_queries as usize).min(queries.len())
+        } else {
+            queries.len()
+        };
+
+        let search_idx = Arc::new(AtomicUsize::new(0));
+        let update_idx = Arc::new(AtomicUsize::new(0));
+        let ratio_searches = ratio.searches as usize;
+        let ratio_updates = ratio.updates as usize;
+        let update_seq_len = update_seq.len();
+        let conn_str = self.connection_string();
+        let index = &self.index;
+        let vector_type = self.vector_type;
+        let upsert_sql = upsert_sql(self.vector_type);
+        let upsert_sql = upsert_sql.as_str();
+
+        let pb = self.create_progress_bar(if unbounded { 0 } else { num_to_run });
+        let start_time = Instant::now();
+
+        let mut times: Vec<f64> = Vec::new();
+        let mut precs: Vec<f64> = Vec::new();
+        let mut recs: Vec<f64> = Vec::new();
+        let mut mrs: Vec<f64> = Vec::new();
+        let mut nds: Vec<f64> = Vec::new();
+        let mut u_times: Vec<f64> = Vec::new();
+        let mut update_failures = 0usize;
+        let mut first_update_error: Option<String> = None;
+        let mut update_retries = 0usize;
+
+        std::thread::scope(|s| {
+            let mut handles = Vec::with_capacity(parallel);
+            for _ in 0..parallel {
+                let conn_str = conn_str.clone();
+                let queries = &queries;
+                let neighbors = &neighbors;
+                let parsed_filters = &parsed_filters;
+                let upd_ids = &upd_ids;
+                let upd_vectors = &upd_vectors;
+                let update_seq = &update_seq;
+                let search_idx = Arc::clone(&search_idx);
+                let update_idx = Arc::clone(&update_idx);
+                let pb = &pb;
+
+                handles.push(s.spawn(move || {
+                    let mut out = MixedWorkerSamples::default();
+
+                    let mut conn = match postgres::Client::connect(&conn_str, postgres::NoTls) {
+                        Ok(c) => c,
+                        Err(e) => {
+                            eprintln!("PostgreSQL connection failed: {}", e);
+                            return out;
+                        }
+                    };
+                    if let Err(e) = apply_search_session(&mut conn, index, knob) {
+                        eprintln!("{}", e);
+                        return out;
+                    }
+                    let upsert = match conn.prepare(upsert_sql) {
+                        Ok(stmt) => stmt,
+                        Err(e) => {
+                            eprintln!("Failed to prepare upsert: {}", pg_error_message(&e));
+                            return out;
+                        }
+                    };
+                    let mut pb_pending: u64 = 0;
+
+                    'outer: loop {
+                        // Checked once per round so a round is never cut
+                        // half-searched/half-updated.
+                        if closed_loop_duration
+                            .map(|duration| Instant::now() >= start_time + duration)
+                            .unwrap_or(false)
+                        {
+                            break 'outer;
+                        }
+
+                        for _ in 0..ratio_searches {
+                            let idx = search_idx.fetch_add(1, Ordering::Relaxed);
+                            if idx >= num_to_run {
+                                break 'outer;
+                            }
+                            let query_pos = idx % queries.len();
+                            let top = explicit_top.unwrap_or_else(|| {
+                                let n = neighbors[query_pos].len();
+                                if n > 0 {
+                                    n
+                                } else {
+                                    10
+                                }
+                            });
+
+                            let (results, query_time) = knn_query(
+                                &mut conn,
+                                distance_op,
+                                vector_type,
+                                &queries[query_pos],
+                                top,
+                                parsed_filters[query_pos].as_ref(),
+                            );
+                            match results {
+                                Ok(ordered_ids) => {
+                                    let m = crate::metrics::compute_metrics(
+                                        &ordered_ids,
+                                        &neighbors[query_pos],
+                                        top,
+                                    );
+                                    out.times.push(query_time);
+                                    out.precs.push(m.precision);
+                                    out.recs.push(m.recall);
+                                    out.mrs.push(m.mrr);
+                                    out.nds.push(m.ndcg);
+                                }
+                                Err(e) => {
+                                    eprintln!("Search query {} failed: {}", idx, e);
+                                }
+                            }
+                            pb_pending += 1;
+                            if pb_pending >= 256 {
+                                pb.inc(pb_pending);
+                                pb_pending = 0;
+                            }
+                        }
+
+                        // With --insert each insert vector is used exactly once,
+                        // so the run stops when the insert set is exhausted.
+                        for _ in 0..ratio_updates {
+                            let uidx = update_idx.fetch_add(1, Ordering::Relaxed);
+                            if use_insert && uidx >= update_seq_len {
+                                break 'outer;
+                            }
+                            let data_idx = update_seq[uidx % update_seq_len];
+
+                            let update_start = Instant::now();
+                            let result = upsert_vector(
+                                &mut conn,
+                                &upsert,
+                                upd_ids[data_idx],
+                                &upd_vectors[data_idx],
+                            );
+                            let update_time = update_start.elapsed().as_secs_f64();
+                            match result {
+                                Ok(retries) => {
+                                    out.u_times.push(update_time);
+                                    out.update_retries += retries;
+                                }
+                                Err(e) => {
+                                    out.update_failures += 1;
+                                    out.first_update_error.get_or_insert(e);
+                                }
+                            }
+                        }
+                    }
+                    if pb_pending > 0 {
+                        pb.inc(pb_pending);
+                    }
+                    out
+                }));
+            }
+
+            for h in handles {
+                let out = h.join().unwrap();
+                times.extend(out.times);
+                precs.extend(out.precs);
+                recs.extend(out.recs);
+                mrs.extend(out.mrs);
+                nds.extend(out.nds);
+                u_times.extend(out.u_times);
+                update_failures += out.update_failures;
+                update_retries += out.update_retries;
+                if first_update_error.is_none() {
+                    first_update_error = out.first_update_error;
+                }
+            }
+        });
+
+        pb.finish_and_clear();
+        let total_time = start_time.elapsed().as_secs_f64();
+
+        // A failed write means the index (e.g. an SVS build without write
+        // support) did not take the workload; don't report it as measured.
+        if update_failures > 0 {
+            return Err(format!(
+                "{} of {} updates failed; first error: {}",
+                update_failures,
+                update_failures + u_times.len(),
+                first_update_error.unwrap_or_default()
+            ));
+        }
+        if times.is_empty() {
+            return Err("No searches completed".to_string());
+        }
+
+        let attempted_queries = search_idx.load(Ordering::Relaxed).min(num_to_run);
+        let top = explicit_top.unwrap_or_else(|| neighbors.first().map(|n| n.len()).unwrap_or(10));
+        let mut results = crate::engine::compute_search_stats(
+            &times,
+            &precs,
+            &recs,
+            &mrs,
+            &nds,
+            total_time,
+            top,
+            parallel,
+            attempted_queries,
+        )?;
+        if !u_times.is_empty() {
+            let mut u_sorted = u_times.clone();
+            u_sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            results.update_count = Some(u_times.len());
+            results.update_rps = Some(u_times.len() as f64 / total_time);
+            results.update_mean_time = Some(u_times.iter().sum::<f64>() / u_times.len() as f64);
+            results.update_p50_time = Some(crate::engine::percentile_linear(&u_sorted, 0.50));
+            results.update_p95_time = Some(crate::engine::percentile_linear(&u_sorted, 0.95));
+            results.update_p99_time = Some(crate::engine::percentile_linear(&u_sorted, 0.99));
+        }
+        results.update_latencies = Some(u_times);
+        results.update_search_ratio = Some(format!("{}:{}", ratio.updates, ratio.searches));
+        results.update_retries = Some(update_retries);
+        if update_retries > 0 {
+            println!(
+                "\tUpdates retried {} times (svs pending-insert slots exhausted)",
+                update_retries
+            );
+        }
+
+        // `neighbors` is ground truth against `train` alone; once every insert
+        // vector is in, score one fresh pass against `allneighbors` (the full
+        // merged corpus). Skipped when the dataset has no `allneighbors`.
+        if use_insert {
+            match self.post_insert_recall(
+                dataset,
+                &queries,
+                &parsed_filters,
+                explicit_top,
+                knob,
+                distance_op,
+                parallel,
+            ) {
+                Ok((mean_recall, recall_p10, recalls)) => {
+                    println!(
+                        "\tPost-insert recall (allneighbors): mean={:.4}, p10={:.4}",
+                        mean_recall, recall_p10
+                    );
+                    results.post_insert_mean_recall = Some(mean_recall);
+                    results.post_insert_recall_p10 = Some(recall_p10);
+                    results.post_insert_recalls = Some(recalls);
+                }
+                Err(e) => {
+                    println!("\tSkipping post-insert recall check: {}", e);
+                }
+            }
+        }
+
+        Ok(results)
     }
 
     fn delete(&mut self) -> Result<(), String> {
@@ -655,16 +1261,366 @@ impl Engine for PgVectorEngine {
     }
 }
 
+// ── Index config ──────────────────────────────────────────────────
+
+/// Resolve the vector index from `algorithm` (top-level, then
+/// `collection_params.algorithm`; default `hnsw`).
+fn parse_pg_index(engine_config: &EngineConfig) -> Result<PgIndex, String> {
+    let cp = engine_config.collection_params.as_ref();
+    let cp_extra = cp.and_then(|cp| cp.extra.as_ref());
+    let algorithm = engine_config
+        .algorithm
+        .clone()
+        .or_else(|| {
+            cp_extra
+                .and_then(|e| e.get("algorithm"))
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| "hnsw".to_string());
+
+    match algorithm.to_lowercase().as_str() {
+        "hnsw" => {
+            let (m, ef_construction) = cp
+                .and_then(|cp| cp.hnsw_config.as_ref())
+                .map(|h| (h.m.unwrap_or(16), h.ef_construction.unwrap_or(128)))
+                .unwrap_or((16, 128));
+            Ok(PgIndex::Hnsw { m, ef_construction })
+        }
+        "svs-vamana" | "vamana" => {
+            let empty = serde_json::Map::new();
+            let block = match cp_extra.and_then(|e| e.get(SVS_CONFIG_KEY)) {
+                None => &empty,
+                Some(v) => v
+                    .as_object()
+                    .ok_or_else(|| format!("{} must be an object, got {}", SVS_CONFIG_KEY, v))?,
+            };
+            Ok(PgIndex::Vamana(parse_vamana_config(block)?))
+        }
+        other => Err(format!(
+            "pgvector does not support algorithm '{}' (expected 'hnsw' or 'svs-vamana')",
+            other
+        )),
+    }
+}
+
+/// Parse the `svs-vamana_config` block. Every key other than the build session
+/// settings is passed through as a `WITH (...)` index option, so the
+/// extension's own option names apply (e.g. `graph_degree`,
+/// `build_window_size`, `compression_type`) and it rejects unknown ones.
+fn parse_vamana_config(
+    block: &serde_json::Map<String, serde_json::Value>,
+) -> Result<VamanaConfig, String> {
+    let mut cfg = VamanaConfig::default();
+    for (key, value) in block {
+        if key == BUILD_MAINTENANCE_WORK_MEM || key == BUILD_MAX_PARALLEL_WORKERS {
+            return Err(format!(
+                "{} is a build setting: set it in collection_params, not {}",
+                key, SVS_CONFIG_KEY
+            ));
+        }
+        // Option names are spliced into the DDL, so allow only plain lowercase
+        // identifiers (which also flags Redis-style keys like GRAPH_MAX_DEGREE
+        // copied over by mistake).
+        let valid = key.starts_with(|c: char| c.is_ascii_lowercase() || c == '_')
+            && key
+                .chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_');
+        if !valid {
+            return Err(format!(
+                "{} option '{}' is not a lowercase SVS index option name",
+                SVS_CONFIG_KEY, key
+            ));
+        }
+        let name = format!("{}.{}", SVS_CONFIG_KEY, key);
+        cfg.with_options
+            .push((key.clone(), sql_literal(&name, value)?));
+    }
+    Ok(cfg)
+}
+
+/// Parse the build settings from the `collection_params` extras.
+fn parse_build_settings(
+    cp_extra: Option<&std::collections::HashMap<String, serde_json::Value>>,
+) -> Result<BuildSettings, String> {
+    let get = |key: &str| cp_extra.and_then(|e| e.get(key));
+    let maintenance_work_mem = get(BUILD_MAINTENANCE_WORK_MEM)
+        .map(|value| match value {
+            // A string with a unit ('64GB') or a number of kB, as in Postgres.
+            serde_json::Value::String(_) | serde_json::Value::Number(_) => {
+                sql_literal(BUILD_MAINTENANCE_WORK_MEM, value)
+            }
+            _ => Err(format!(
+                "{} must be a string or number, got {}",
+                BUILD_MAINTENANCE_WORK_MEM, value
+            )),
+        })
+        .transpose()?;
+    let max_parallel_workers = get(BUILD_MAX_PARALLEL_WORKERS)
+        .map(|value| {
+            value.as_u64().ok_or_else(|| {
+                format!(
+                    "{} must be a non-negative integer, got {}",
+                    BUILD_MAX_PARALLEL_WORKERS, value
+                )
+            })
+        })
+        .transpose()?;
+    Ok(BuildSettings {
+        maintenance_work_mem,
+        max_parallel_workers,
+    })
+}
+
+/// `data_type` from `collection_params`, else `upload_params` (as in the Redis
+/// configs): `FLOAT32` (default) or `FLOAT16`.
+fn parse_vector_type(engine_config: &EngineConfig) -> Result<VectorType, String> {
+    let data_type = engine_config
+        .collection_params
+        .as_ref()
+        .and_then(|cp| cp.extra.as_ref())
+        .and_then(|e| e.get("data_type"))
+        .or_else(|| {
+            engine_config
+                .upload_params
+                .as_ref()
+                .and_then(|p| p.get("data_type"))
+        });
+    match data_type {
+        None => Ok(VectorType::Vector),
+        Some(v) => match v.as_str().map(str::to_uppercase).as_deref() {
+            Some("FLOAT32") => Ok(VectorType::Vector),
+            Some("FLOAT16") => Ok(VectorType::HalfVec),
+            _ => Err(format!(
+                "pgvector data_type must be FLOAT32 or FLOAT16, got {}",
+                v
+            )),
+        },
+    }
+}
+
+/// Render a JSON scalar as a SQL literal for DDL / SET.
+fn sql_literal(name: &str, value: &serde_json::Value) -> Result<String, String> {
+    match value {
+        serde_json::Value::Number(n) => Ok(n.to_string()),
+        serde_json::Value::Bool(b) => Ok(b.to_string()),
+        serde_json::Value::String(s) => Ok(format!("'{}'", s.replace('\'', "''"))),
+        _ => Err(format!(
+            "{} must be a number, boolean or string, got {}",
+            name, value
+        )),
+    }
+}
+
+fn vamana_index_sql(ops_class: &str, cfg: &VamanaConfig) -> String {
+    let mut sql = format!(
+        "CREATE INDEX ON items USING vamana(embedding {})",
+        ops_class
+    );
+    if !cfg.with_options.is_empty() {
+        let options: Vec<String> = cfg
+            .with_options
+            .iter()
+            .map(|(k, v)| format!("{} = {}", k, v))
+            .collect();
+        sql.push_str(&format!(" WITH ({})", options.join(", ")));
+    }
+    sql
+}
+
+/// Session settings applied on the build connection before `CREATE INDEX`.
+fn build_session_sql(build: &BuildSettings) -> Vec<String> {
+    let mut stmts = Vec::new();
+    if let Some(mem) = &build.maintenance_work_mem {
+        stmts.push(format!("SET maintenance_work_mem = {}", mem));
+    }
+    if let Some(n) = build.max_parallel_workers {
+        // Not `SET max_parallel_workers`: the pool also holds the SVS search
+        // threads (parked parallel workers), so capping it at the build's
+        // size leaves no workers for the build, which then runs serially.
+        stmts.push(format!("SET max_parallel_maintenance_workers = {}", n));
+        stmts.push(format!("ALTER TABLE items SET (parallel_workers = {})", n));
+    }
+    stmts
+}
+
+// ── Search session + queries ──────────────────────────────────────
+
+/// The index's search-time knob: HNSW `ef_search` (`ef`, else `hnsw_ef`;
+/// default 128) or Vamana `search_window_size` (`search_window_size`, else
+/// `ef`; `None` keeps the extension default). Calibration sets either key.
+fn search_knob(index: &PgIndex, params: &SearchParams) -> Option<i64> {
+    let sp = params.search_params.as_ref();
+    let extra_i64 = |key: &str| {
+        sp.and_then(|sp| sp.extra.as_ref())
+            .and_then(|e| e.get(key))
+            .and_then(|v| v.as_i64())
+    };
+    match index {
+        PgIndex::Hnsw { .. } => Some(
+            sp.and_then(|sp| sp.ef)
+                .or_else(|| extra_i64("hnsw_ef"))
+                .unwrap_or(128),
+        ),
+        PgIndex::Vamana(_) => extra_i64("search_window_size")
+            .or_else(|| extra_i64("SEARCH_WINDOW_SIZE"))
+            .or_else(|| sp.and_then(|sp| sp.ef)),
+    }
+}
+
+/// Apply the index's search settings to a connection.
+fn apply_search_session(
+    conn: &mut postgres::Client,
+    index: &PgIndex,
+    knob: Option<i64>,
+) -> Result<(), String> {
+    match index {
+        PgIndex::Hnsw { .. } => {
+            if let Some(ef) = knob {
+                let _ = conn.execute(&format!("SET hnsw.ef_search = {}", ef), &[]);
+            }
+            // Enable iterative index scans (pgvector >= 0.8) so that
+            // non-sargable filters (e.g. array contains-any) keep pulling
+            // from the HNSW index until LIMIT is satisfied in exact order,
+            // instead of post-filtering a bounded candidate set.
+            let _ = conn.execute("SET hnsw.iterative_scan = strict_order", &[]);
+        }
+        PgIndex::Vamana(_) => {
+            // Not best effort: an ignored window would silently search with
+            // the default and make calibration meaningless.
+            if let Some(window) = knob {
+                conn.execute(&format!("SET svs.search_window_size = {}", window), &[])
+                    .map_err(|e| {
+                        format!(
+                            "Failed to set svs.search_window_size: {}",
+                            pg_error_message(&e)
+                        )
+                    })?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Run one KNN query, returning the ordered ids and the query round-trip time.
+/// `top` (LIMIT) and every filter value are BOUND params, not inlined, so the
+/// statement text is stable per filter shape and the plan is reused across
+/// queries.
+fn knn_query(
+    conn: &mut postgres::Client,
+    distance_op: &str,
+    vector_type: VectorType,
+    query: &[f32],
+    top: usize,
+    filter: Option<&(String, Vec<PgValue>)>,
+) -> (Result<Vec<i64>, postgres::Error>, f64) {
+    let query_vec = pgvector::Vector::from(query.to_vec());
+    let top_param = top as i64;
+    let where_clause = filter
+        .map(|(tmpl, _)| format!(" WHERE {}", tmpl))
+        .unwrap_or_default();
+
+    // $1 = query vector, $2 = LIMIT (bigint), $3.. = filter values.
+    let query_sql = format!(
+        "SELECT id, embedding {} {} AS _score FROM items{} ORDER BY _score LIMIT $2::bigint",
+        distance_op,
+        vector_type.param(1),
+        where_clause
+    );
+
+    let mut query_params: Vec<&(dyn ToSql + Sync)> =
+        Vec::with_capacity(2 + filter.map(|(_, v)| v.len()).unwrap_or(0));
+    query_params.push(&query_vec);
+    query_params.push(&top_param);
+    if let Some((_, values)) = filter {
+        for v in values {
+            query_params.push(v.as_sql());
+        }
+    }
+
+    let query_start = Instant::now();
+    let results = conn.query(&query_sql, &query_params);
+    let query_time = query_start.elapsed().as_secs_f64();
+
+    let ids = results.map(|rows| {
+        rows.iter()
+            .map(|row| {
+                let id: i32 = row.get(0);
+                id as i64
+            })
+            .collect()
+    });
+    (ids, query_time)
+}
+
+/// Give up retrying a rejected write after this long.
+const UPSERT_RETRY_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Upsert one vector, returning how many times it was retried. Writes that svs
+/// rejects for lack of a pending-insert slot are retried with backoff, as an
+/// application would; any other error fails the write.
+fn upsert_vector(
+    conn: &mut postgres::Client,
+    upsert: &postgres::Statement,
+    id: i64,
+    vector: &[f32],
+) -> Result<usize, String> {
+    // `items.id` is SERIAL (int4).
+    let id = i32::try_from(id).map_err(|_| format!("id {} does not fit items.id (int4)", id))?;
+    let embedding = pgvector::Vector::from(vector.to_vec());
+    let start = Instant::now();
+    let mut backoff = std::time::Duration::from_micros(100);
+    let mut retries = 0;
+    loop {
+        match conn.execute(upsert, &[&id, &embedding]) {
+            Ok(_) => return Ok(retries),
+            Err(e)
+                if is_svs_insert_slot_exhausted(&e) && start.elapsed() < UPSERT_RETRY_DEADLINE =>
+            {
+                retries += 1;
+                std::thread::sleep(backoff);
+                backoff = (backoff * 2).min(std::time::Duration::from_millis(10));
+            }
+            Err(e) => {
+                return Err(format!(
+                    "upsert of id {} failed after {} retries: {}",
+                    id,
+                    retries,
+                    pg_error_message(&e)
+                ))
+            }
+        }
+    }
+}
+
+/// svs rejects an index insert with `program_limit_exceeded` when every one of
+/// its per-database pending-insert reservation slots is in use
+/// (`SVS_MAX_PENDING_INSERT_RESERVATIONS`, 64 in svs 0.1.0), i.e. when more
+/// writes are in flight than that. The write can be retried.
+fn is_svs_insert_slot_exhausted(e: &postgres::Error) -> bool {
+    e.code() == Some(&postgres::error::SqlState::PROGRAM_LIMIT_EXCEEDED)
+        && e.as_db_error()
+            .is_some_and(|db| db.message().contains("pending SVS insert batches"))
+}
+
+/// The server's message for a database error (`Display` only says "db error").
+fn pg_error_message(e: &postgres::Error) -> String {
+    e.as_db_error()
+        .map(|db| db.message().to_string())
+        .unwrap_or_else(|| e.to_string())
+}
+
 // ── PgVector condition parser ─────────────────────────────────────
 
-/// Map a dataset distance name to the pgvector `(operator, hnsw_ops_class)` pair.
-/// `dot`/`ip` is unsupported and unknown metrics error. A wrong arm here (e.g.
-/// L2 op with a cosine ops class) would silently change ranking, so every arm is
-/// unit-tested.
+/// Map a dataset distance name to the pgvector `(operator, ops_class)` pair.
+/// Unknown metrics error. A wrong arm here (e.g. L2 op with a cosine ops class)
+/// would silently change ranking, so every arm is unit-tested. `<#>` is the
+/// negative inner product, so ascending order ranks by descending similarity.
 fn map_pg_distance_ops(distance: &str) -> Result<(&'static str, &'static str), String> {
     match distance.to_lowercase().as_str() {
         "l2" | "euclidean" => Ok(("<->", "vector_l2_ops")),
         "cosine" | "angular" => Ok(("<=>", "vector_cosine_ops")),
+        "dot" | "ip" => Ok(("<#>", "vector_ip_ops")),
         other => Err(format!(
             "PgVector does not support distance metric: {}",
             other
@@ -1337,10 +2293,293 @@ mod tests {
             map_pg_distance_ops("COSINE").unwrap(),
             ("<=>", "vector_cosine_ops")
         );
-        // dot/ip unsupported; unknown errors too.
-        assert!(map_pg_distance_ops("dot").is_err());
-        assert!(map_pg_distance_ops("ip").is_err());
+        assert_eq!(
+            map_pg_distance_ops("dot").unwrap(),
+            ("<#>", "vector_ip_ops")
+        );
+        assert_eq!(map_pg_distance_ops("ip").unwrap(), ("<#>", "vector_ip_ops"));
         assert!(map_pg_distance_ops("nope").is_err());
+    }
+
+    // ── Index config ───────────────────────────────────────────────────────
+
+    fn engine_config(v: serde_json::Value) -> EngineConfig {
+        serde_json::from_value(v).unwrap()
+    }
+
+    fn search_params(v: serde_json::Value) -> SearchParams {
+        serde_json::from_value(v).unwrap()
+    }
+
+    #[test]
+    fn index_defaults_to_hnsw() {
+        let cfg = engine_config(json!({"name": "pg", "engine": "pgvector"}));
+        assert_eq!(
+            parse_pg_index(&cfg).unwrap(),
+            PgIndex::Hnsw {
+                m: 16,
+                ef_construction: 128
+            }
+        );
+        let cfg = engine_config(json!({
+            "name": "pg", "engine": "pgvector",
+            "collection_params": {"hnsw_config": {"m": 32, "ef_construct": 256}}
+        }));
+        assert_eq!(
+            parse_pg_index(&cfg).unwrap(),
+            PgIndex::Hnsw {
+                m: 32,
+                ef_construction: 256
+            }
+        );
+    }
+
+    #[test]
+    fn index_selects_vamana_from_collection_params_or_top_level() {
+        let nested = engine_config(json!({
+            "name": "pg", "engine": "pgvector",
+            "collection_params": {"algorithm": "svs-vamana"}
+        }));
+        assert_eq!(
+            parse_pg_index(&nested).unwrap(),
+            PgIndex::Vamana(VamanaConfig::default())
+        );
+        let top = engine_config(json!({
+            "name": "pg", "engine": "pgvector", "algorithm": "SVS-VAMANA"
+        }));
+        assert!(matches!(parse_pg_index(&top).unwrap(), PgIndex::Vamana(_)));
+        let bad = engine_config(json!({"name": "pg", "engine": "pgvector", "algorithm": "ivf"}));
+        assert!(parse_pg_index(&bad).is_err());
+    }
+
+    #[test]
+    fn vamana_config_passes_options_through() {
+        let cfg = engine_config(json!({
+            "name": "pg", "engine": "pgvector",
+            "collection_params": {
+                "algorithm": "svs-vamana",
+                "svs-vamana_config": {
+                    "graph_degree": 32,
+                    "alpha": 120,
+                    "use_search_history": true,
+                    "compression_type": "it's"
+                }
+            }
+        }));
+        let PgIndex::Vamana(v) = parse_pg_index(&cfg).unwrap() else {
+            panic!("expected Vamana");
+        };
+        let mut opts = v.with_options.clone();
+        opts.sort();
+        assert_eq!(
+            opts,
+            vec![
+                ("alpha".to_string(), "120".to_string()),
+                ("compression_type".to_string(), "'it''s'".to_string()),
+                ("graph_degree".to_string(), "32".to_string()),
+                ("use_search_history".to_string(), "true".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn vamana_config_rejects_unsafe_or_malformed_entries() {
+        let parse = |block: serde_json::Value| parse_vamana_config(block.as_object().unwrap());
+        // Redis-style uppercase key, and anything that could escape the DDL.
+        assert!(parse(json!({"GRAPH_MAX_DEGREE": 32})).is_err());
+        assert!(parse(json!({"graph_degree = 1); DROP TABLE items; --": 1})).is_err());
+        assert!(parse(json!({"graph_degree": [32]})).is_err());
+        // Build settings belong in collection_params.
+        assert!(parse(json!({"max_parallel_workers": 4})).is_err());
+        assert!(parse(json!({"maintenance_work_mem": "8GB"})).is_err());
+    }
+
+    fn cp_extra(v: serde_json::Value) -> std::collections::HashMap<String, serde_json::Value> {
+        serde_json::from_value(v).unwrap()
+    }
+
+    #[test]
+    fn build_settings_from_collection_params() {
+        let b = parse_build_settings(Some(&cp_extra(
+            json!({"maintenance_work_mem": "8GB", "max_parallel_workers": 4}),
+        )))
+        .unwrap();
+        assert_eq!(b.maintenance_work_mem.as_deref(), Some("'8GB'"));
+        assert_eq!(b.max_parallel_workers, Some(4));
+        assert_eq!(
+            build_session_sql(&b),
+            vec![
+                "SET maintenance_work_mem = '8GB'",
+                "SET max_parallel_maintenance_workers = 4",
+                "ALTER TABLE items SET (parallel_workers = 4)",
+            ]
+        );
+        let kb = parse_build_settings(Some(&cp_extra(json!({"maintenance_work_mem": 65536}))));
+        assert_eq!(kb.unwrap().maintenance_work_mem.as_deref(), Some("65536"));
+        assert!(
+            parse_build_settings(Some(&cp_extra(json!({"max_parallel_workers": -1})))).is_err()
+        );
+        assert!(
+            parse_build_settings(Some(&cp_extra(json!({"maintenance_work_mem": true})))).is_err()
+        );
+        assert!(build_session_sql(&parse_build_settings(None).unwrap()).is_empty());
+    }
+
+    #[test]
+    fn vector_type_from_data_type() {
+        let parse = |extra: serde_json::Value| {
+            let mut cfg = json!({"name": "pg", "engine": "pgvector"});
+            cfg.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            parse_vector_type(&engine_config(cfg))
+        };
+        assert_eq!(parse(json!({})).unwrap(), VectorType::Vector);
+        assert_eq!(
+            parse(json!({"collection_params": {"data_type": "float16"}})).unwrap(),
+            VectorType::HalfVec
+        );
+        // Redis configs also carry it in upload_params.
+        assert_eq!(
+            parse(json!({"upload_params": {"data_type": "FLOAT16"}})).unwrap(),
+            VectorType::HalfVec
+        );
+        assert_eq!(
+            parse(json!({"collection_params": {"data_type": "FLOAT32"}})).unwrap(),
+            VectorType::Vector
+        );
+        assert!(parse(json!({"collection_params": {"data_type": "INT8"}})).is_err());
+    }
+
+    #[test]
+    fn halfvec_casts_query_params_and_ops() {
+        assert_eq!(VectorType::Vector.param(1), "$1");
+        assert_eq!(VectorType::HalfVec.param(2), "$2::vector::halfvec");
+        assert_eq!(
+            VectorType::Vector.ops_class("vector_ip_ops"),
+            "vector_ip_ops"
+        );
+        assert_eq!(
+            VectorType::HalfVec.ops_class("vector_ip_ops"),
+            "halfvec_ip_ops"
+        );
+        assert_eq!(
+            upsert_sql(VectorType::HalfVec),
+            "INSERT INTO items (id, embedding) VALUES ($1, $2::vector::halfvec) \
+             ON CONFLICT (id) DO UPDATE SET embedding = EXCLUDED.embedding"
+        );
+    }
+
+    fn dataset(distance: &str) -> Dataset {
+        Dataset::new(
+            serde_json::from_value(json!({"name": "d", "path": "d", "distance": distance}))
+                .unwrap(),
+        )
+    }
+
+    fn new_engine(cp: serde_json::Value) -> Result<PgVectorEngine, String> {
+        PgVectorEngine::new(
+            &engine_config(json!({"name": "pg", "engine": "pgvector", "collection_params": cp})),
+            "localhost",
+        )
+    }
+
+    #[test]
+    fn distance_override_only_on_normalized_datasets() {
+        let ip = new_engine(json!({"distance": "dot", "data_type": "FLOAT16"})).unwrap();
+        assert_eq!(
+            ip.distance_ops(&dataset("cosine")).unwrap(),
+            ("<#>", "halfvec_ip_ops".to_string())
+        );
+        assert_eq!(
+            ip.distance_ops(&dataset("dot")).unwrap(),
+            ("<#>", "halfvec_ip_ops".to_string())
+        );
+        // L2 data is not normalized, so IP would rank differently.
+        assert!(ip.distance_ops(&dataset("l2")).is_err());
+
+        let l2 = new_engine(json!({"normalize_cosine": true})).unwrap();
+        assert_eq!(
+            l2.distance_ops(&dataset("angular")).unwrap(),
+            ("<->", "vector_l2_ops".to_string())
+        );
+        assert_eq!(
+            new_engine(json!({}))
+                .unwrap()
+                .distance_ops(&dataset("cosine"))
+                .unwrap(),
+            ("<=>", "vector_cosine_ops".to_string())
+        );
+        assert!(new_engine(json!({"normalize_cosine": true, "distance": "dot"})).is_err());
+        assert!(new_engine(json!({"distance": "hamming"})).is_err());
+    }
+
+    #[test]
+    fn index_after_load_is_forced_for_vamana() {
+        assert!(!new_engine(json!({})).unwrap().index_after_load);
+        assert!(
+            new_engine(json!({"index_after_load": true}))
+                .unwrap()
+                .index_after_load
+        );
+        assert!(
+            new_engine(json!({"algorithm": "svs-vamana"}))
+                .unwrap()
+                .index_after_load
+        );
+        assert_eq!(
+            new_engine(json!({"hnsw_config": {"m": 8, "ef_construct": 64}}))
+                .unwrap()
+                .index_sql("halfvec_ip_ops"),
+            "CREATE INDEX ON items USING hnsw(embedding halfvec_ip_ops) WITH (m = 8, ef_construction = 64)"
+        );
+    }
+
+    #[test]
+    fn vamana_index_sql_omits_with_clause_when_no_options() {
+        assert_eq!(
+            vamana_index_sql("vector_ip_ops", &VamanaConfig::default()),
+            "CREATE INDEX ON items USING vamana(embedding vector_ip_ops)"
+        );
+        let cfg = VamanaConfig {
+            with_options: vec![
+                ("graph_degree".to_string(), "64".to_string()),
+                ("build_window_size".to_string(), "128".to_string()),
+            ],
+        };
+        assert_eq!(
+            vamana_index_sql("vector_l2_ops", &cfg),
+            "CREATE INDEX ON items USING vamana(embedding vector_l2_ops) \
+             WITH (graph_degree = 64, build_window_size = 128)"
+        );
+    }
+
+    #[test]
+    fn search_knob_per_index() {
+        let hnsw = PgIndex::Hnsw {
+            m: 16,
+            ef_construction: 128,
+        };
+        let vamana = PgIndex::Vamana(VamanaConfig::default());
+
+        let none = search_params(json!({"parallel": 1}));
+        assert_eq!(search_knob(&hnsw, &none), Some(128));
+        assert_eq!(search_knob(&vamana, &none), None);
+
+        let hnsw_ef = search_params(json!({"search_params": {"hnsw_ef": 64}}));
+        assert_eq!(search_knob(&hnsw, &hnsw_ef), Some(64));
+        assert_eq!(search_knob(&vamana, &hnsw_ef), None);
+
+        // Calibration writes `ef` into InnerSearchParams.ef, any other
+        // calibration_param into its extras.
+        let ef = search_params(json!({"search_params": {"ef": 200}}));
+        assert_eq!(search_knob(&hnsw, &ef), Some(200));
+        assert_eq!(search_knob(&vamana, &ef), Some(200));
+
+        let window = search_params(json!({"search_params": {"search_window_size": 48, "ef": 200}}));
+        assert_eq!(search_knob(&vamana, &window), Some(48));
+        let upper = search_params(json!({"search_params": {"SEARCH_WINDOW_SIZE": 96}}));
+        assert_eq!(search_knob(&vamana, &upper), Some(96));
     }
 
     // ── Exact-match numeric / bool / non-scalar arms ───────────────────────

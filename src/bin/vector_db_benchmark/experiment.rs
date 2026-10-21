@@ -169,16 +169,20 @@ pub fn run(args: &Args) -> Result<(), String> {
     }
 
     if args.target_qps > 0.0 || args.search_duration > 0.0 {
+        // pgvector supports closed-loop duration only, not open-loop target QPS.
         let unsupported: Vec<_> = engines
             .iter()
             .filter_map(|(name, config)| {
                 let engine_type = config.engine.as_deref().unwrap_or("unknown");
-                (!matches!(engine_type, "redis" | "vertex")).then_some(name.as_str())
+                let supported = matches!(engine_type, "redis" | "vertex")
+                    || (engine_type == "pgvector" && args.target_qps <= 0.0);
+                (!supported).then_some(name.as_str())
             })
             .collect();
         if !unsupported.is_empty() {
             return Err(format!(
-                "duration-bounded search currently supports Redis and Vertex only; unsupported: {}",
+                "duration-bounded search currently supports Redis and Vertex (and pgvector \
+                 without --target-qps) only; unsupported: {}",
                 unsupported.join(", ")
             ));
         }
@@ -192,12 +196,12 @@ pub fn run(args: &Args) -> Result<(), String> {
             .iter()
             .filter_map(|(name, config)| {
                 let engine_type = config.engine.as_deref().unwrap_or("unknown");
-                (engine_type != "redis").then_some(name.as_str())
+                (!matches!(engine_type, "redis" | "pgvector")).then_some(name.as_str())
             })
             .collect();
         if !unsupported.is_empty() {
             return Err(format!(
-                "--insert currently supports the Redis engine only; unsupported: {}",
+                "--insert currently supports Redis and pgvector only; unsupported: {}",
                 unsupported.join(", ")
             ));
         }
@@ -1176,6 +1180,9 @@ fn save_search_results(
         }
         if let Some(t) = results.update_p99_time {
             results_obj.insert("update_p99_time".to_string(), json!(t));
+        }
+        if let Some(retries) = results.update_retries {
+            results_obj.insert("update_retries".to_string(), json!(retries));
         }
         if let Some(ref lats) = results.update_latencies {
             results_obj.insert(

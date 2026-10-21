@@ -1,0 +1,438 @@
+[
+    {
+        "name": "dbpedia-cal-pgvector-hnsw-float32",
+        "engine": "pgvector",
+        "connection_params": {},
+        "collection_params": {
+            "data_type": "FLOAT32",
+            "distance": "dot",
+            "index_after_load": true,
+            "maintenance_work_mem": "32GB",
+            "max_parallel_workers": 48,
+            "hnsw_config": {
+                "m": 16,
+                "ef_construct": 200
+            }
+        },
+        "search_params": [
+            {
+                "parallel": 100,
+                "top": 100,
+                "calibration_param": "ef",
+                "calibration_precision": 0.95
+            }
+        ],
+        "upload_params": {
+            "parallel": 16,
+            "batch_size": 1024
+        }
+    },
+    {
+        "name": "dbpedia-cal-pgvector-svs-noquant",
+        "engine": "pgvector",
+        "connection_params": {},
+        "collection_params": {
+            "algorithm": "svs-vamana",
+            "data_type": "FLOAT32",
+            "distance": "dot",
+            "index_after_load": true,
+            "maintenance_work_mem": "32GB",
+            "max_parallel_workers": 48,
+            "svs-vamana_config": {
+                "graph_degree": 32,
+                "build_window_size": 200
+            }
+        },
+        "search_params": [
+            {
+                "parallel": 100,
+                "top": 100,
+                "calibration_param": "search_window_size",
+                "calibration_precision": 0.95
+            }
+        ],
+        "upload_params": {
+            "parallel": 16,
+            "batch_size": 1024
+        }
+    },
+    {
+        "name": "dbpedia-cal-pgvector-svs-LVQ4X8",
+        "engine": "pgvector",
+        "connection_params": {},
+        "collection_params": {
+            "algorithm": "svs-vamana",
+            "data_type": "FLOAT32",
+            "distance": "dot",
+            "index_after_load": true,
+            "maintenance_work_mem": "32GB",
+            "max_parallel_workers": 48,
+            "svs-vamana_config": {
+                "graph_degree": 32,
+                "build_window_size": 200,
+                "compression_type": 2,
+                "compression_primary": 4,
+                "compression_secondary": 8
+            }
+        },
+        "search_params": [
+            {
+                "parallel": 100,
+                "top": 100,
+                "calibration_param": "search_window_size",
+                "calibration_precision": 0.95
+            }
+        ],
+        "upload_params": {
+            "parallel": 16,
+            "batch_size": 1024
+        }
+    },
+    {
+        "name": "dbpedia-cal-pgvector-svs-LVQ4X4",
+        "engine": "pgvector",
+        "connection_params": {},
+        "collection_params": {
+            "algorithm": "svs-vamana",
+            "data_type": "FLOAT32",
+            "distance": "dot",
+            "index_after_load": true,
+            "maintenance_work_mem": "32GB",
+            "max_parallel_workers": 48,
+            "svs-vamana_config": {
+                "graph_degree": 32,
+                "build_window_size": 200,
+                "compression_type": 2,
+                "compression_primary": 4,
+                "compression_secondary": 4
+            }
+        },
+        "search_params": [
+            {
+                "parallel": 100,
+                "top": 100,
+                "calibration_param": "search_window_size",
+                "calibration_precision": 0.95
+            }
+        ],
+        "upload_params": {
+            "parallel": 16,
+            "batch_size": 1024
+        }
+    },
+    {
+        "name": "dbpedia-cal-pgvector-svs-LVQ8",
+        "engine": "pgvector",
+        "connection_params": {},
+        "collection_params": {
+            "algorithm": "svs-vamana",
+            "data_type": "FLOAT32",
+            "distance": "dot",
+            "index_after_load": true,
+            "maintenance_work_mem": "32GB",
+            "max_parallel_workers": 48,
+            "svs-vamana_config": {
+                "graph_degree": 32,
+                "build_window_size": 200,
+                "compression_type": 2,
+                "compression_primary": 8,
+                "compression_secondary": 0
+            }
+        },
+        "search_params": [
+            {
+                "parallel": 100,
+                "top": 100,
+                "calibration_param": "search_window_size",
+                "calibration_precision": 0.95
+            }
+        ],
+        "upload_params": {
+            "parallel": 16,
+            "batch_size": 1024
+        }
+    },
+    {
+        "name": "dbpedia-cal-pgvector-svs-LeanVec4x8",
+        "engine": "pgvector",
+        "connection_params": {},
+        "collection_params": {
+            "algorithm": "svs-vamana",
+            "data_type": "FLOAT32",
+            "distance": "dot",
+            "index_after_load": true,
+            "maintenance_work_mem": "32GB",
+            "max_parallel_workers": 48,
+            "svs-vamana_config": {
+                "graph_degree": 32,
+                "build_window_size": 200,
+                "compression_type": 1,
+                "compression_primary": 4,
+                "compression_secondary": 8
+            }
+        },
+        "search_params": [
+            {
+                "parallel": 100,
+                "top": 100,
+                "calibration_param": "search_window_size",
+                "calibration_precision": 0.95
+            }
+        ],
+        "upload_params": {
+            "parallel": 16,
+            "batch_size": 1024
+        }
+    },
+    {
+        "name": "dbpedia-cal-pgvector-svs-LeanVec4x8-div4",
+        "engine": "pgvector",
+        "connection_params": {},
+        "collection_params": {
+            "algorithm": "svs-vamana",
+            "data_type": "FLOAT32",
+            "distance": "dot",
+            "index_after_load": true,
+            "maintenance_work_mem": "32GB",
+            "max_parallel_workers": 48,
+            "svs-vamana_config": {
+                "graph_degree": 32,
+                "build_window_size": 200,
+                "compression_type": 1,
+                "compression_primary": 4,
+                "compression_secondary": 8,
+                "leanvec_dims": 384
+            }
+        },
+        "search_params": [
+            {
+                "parallel": 100,
+                "top": 100,
+                "calibration_param": "search_window_size",
+                "calibration_precision": 0.95
+            }
+        ],
+        "upload_params": {
+            "parallel": 16,
+            "batch_size": 1024
+        }
+    },
+    {
+        "name": "dbpedia-cal-pgvector-hnsw-float16",
+        "engine": "pgvector",
+        "connection_params": {},
+        "collection_params": {
+            "data_type": "FLOAT16",
+            "distance": "dot",
+            "index_after_load": true,
+            "maintenance_work_mem": "32GB",
+            "max_parallel_workers": 48,
+            "hnsw_config": {
+                "m": 16,
+                "ef_construct": 200
+            }
+        },
+        "search_params": [
+            {
+                "parallel": 100,
+                "top": 100,
+                "calibration_param": "ef",
+                "calibration_precision": 0.95
+            }
+        ],
+        "upload_params": {
+            "parallel": 16,
+            "batch_size": 1024
+        }
+    },
+    {
+        "name": "dbpedia-cal-pgvector-svs-noquant-float16",
+        "engine": "pgvector",
+        "connection_params": {},
+        "collection_params": {
+            "algorithm": "svs-vamana",
+            "data_type": "FLOAT16",
+            "distance": "dot",
+            "index_after_load": true,
+            "maintenance_work_mem": "32GB",
+            "max_parallel_workers": 48,
+            "svs-vamana_config": {
+                "graph_degree": 32,
+                "build_window_size": 200
+            }
+        },
+        "search_params": [
+            {
+                "parallel": 100,
+                "top": 100,
+                "calibration_param": "search_window_size",
+                "calibration_precision": 0.95
+            }
+        ],
+        "upload_params": {
+            "parallel": 16,
+            "batch_size": 1024
+        }
+    },
+    {
+        "name": "dbpedia-cal-pgvector-svs-LVQ4X8-float16",
+        "engine": "pgvector",
+        "connection_params": {},
+        "collection_params": {
+            "algorithm": "svs-vamana",
+            "data_type": "FLOAT16",
+            "distance": "dot",
+            "index_after_load": true,
+            "maintenance_work_mem": "32GB",
+            "max_parallel_workers": 48,
+            "svs-vamana_config": {
+                "graph_degree": 32,
+                "build_window_size": 200,
+                "compression_type": 2,
+                "compression_primary": 4,
+                "compression_secondary": 8
+            }
+        },
+        "search_params": [
+            {
+                "parallel": 100,
+                "top": 100,
+                "calibration_param": "search_window_size",
+                "calibration_precision": 0.95
+            }
+        ],
+        "upload_params": {
+            "parallel": 16,
+            "batch_size": 1024
+        }
+    },
+    {
+        "name": "dbpedia-cal-pgvector-svs-LVQ4X4-float16",
+        "engine": "pgvector",
+        "connection_params": {},
+        "collection_params": {
+            "algorithm": "svs-vamana",
+            "data_type": "FLOAT16",
+            "distance": "dot",
+            "index_after_load": true,
+            "maintenance_work_mem": "32GB",
+            "max_parallel_workers": 48,
+            "svs-vamana_config": {
+                "graph_degree": 32,
+                "build_window_size": 200,
+                "compression_type": 2,
+                "compression_primary": 4,
+                "compression_secondary": 4
+            }
+        },
+        "search_params": [
+            {
+                "parallel": 100,
+                "top": 100,
+                "calibration_param": "search_window_size",
+                "calibration_precision": 0.95
+            }
+        ],
+        "upload_params": {
+            "parallel": 16,
+            "batch_size": 1024
+        }
+    },
+    {
+        "name": "dbpedia-cal-pgvector-svs-LVQ8-float16",
+        "engine": "pgvector",
+        "connection_params": {},
+        "collection_params": {
+            "algorithm": "svs-vamana",
+            "data_type": "FLOAT16",
+            "distance": "dot",
+            "index_after_load": true,
+            "maintenance_work_mem": "32GB",
+            "max_parallel_workers": 48,
+            "svs-vamana_config": {
+                "graph_degree": 32,
+                "build_window_size": 200,
+                "compression_type": 2,
+                "compression_primary": 8,
+                "compression_secondary": 0
+            }
+        },
+        "search_params": [
+            {
+                "parallel": 100,
+                "top": 100,
+                "calibration_param": "search_window_size",
+                "calibration_precision": 0.95
+            }
+        ],
+        "upload_params": {
+            "parallel": 16,
+            "batch_size": 1024
+        }
+    },
+    {
+        "name": "dbpedia-cal-pgvector-svs-LeanVec4x8-float16",
+        "engine": "pgvector",
+        "connection_params": {},
+        "collection_params": {
+            "algorithm": "svs-vamana",
+            "data_type": "FLOAT16",
+            "distance": "dot",
+            "index_after_load": true,
+            "maintenance_work_mem": "32GB",
+            "max_parallel_workers": 48,
+            "svs-vamana_config": {
+                "graph_degree": 32,
+                "build_window_size": 200,
+                "compression_type": 1,
+                "compression_primary": 4,
+                "compression_secondary": 8
+            }
+        },
+        "search_params": [
+            {
+                "parallel": 100,
+                "top": 100,
+                "calibration_param": "search_window_size",
+                "calibration_precision": 0.95
+            }
+        ],
+        "upload_params": {
+            "parallel": 16,
+            "batch_size": 1024
+        }
+    },
+    {
+        "name": "dbpedia-cal-pgvector-svs-LeanVec4x8-div4-float16",
+        "engine": "pgvector",
+        "connection_params": {},
+        "collection_params": {
+            "algorithm": "svs-vamana",
+            "data_type": "FLOAT16",
+            "distance": "dot",
+            "index_after_load": true,
+            "maintenance_work_mem": "32GB",
+            "max_parallel_workers": 48,
+            "svs-vamana_config": {
+                "graph_degree": 32,
+                "build_window_size": 200,
+                "compression_type": 1,
+                "compression_primary": 4,
+                "compression_secondary": 8,
+                "leanvec_dims": 384
+            }
+        },
+        "search_params": [
+            {
+                "parallel": 100,
+                "top": 100,
+                "calibration_param": "search_window_size",
+                "calibration_precision": 0.95
+            }
+        ],
+        "upload_params": {
+            "parallel": 16,
+            "batch_size": 1024
+        }
+    }
+]

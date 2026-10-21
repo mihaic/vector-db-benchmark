@@ -1376,3 +1376,81 @@ pub fn read_results_obj(root: &Path, engine: &str) -> serde_json::Value {
     let v: serde_json::Value = serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap();
     v["results"].clone()
 }
+
+/// Write an HDF5 dataset carrying `train`/`insert`/`test`/`neighbors`/
+/// `allneighbors`, and a project layout (datasets.json + engine config) that
+/// points at it. `neighbors` is ground truth against `train` alone;
+/// `allneighbors` is ground truth against `train`+`insert` combined — mirrors
+/// the real `*_insert_*` HDF5 datasets used by `--insert` (e.g.
+/// cohere-768-1M_insert_100000_42_mip.hdf5).
+#[allow(clippy::too_many_arguments)]
+pub fn write_insert_hdf5_project(
+    dataset_name: &str,
+    engine_configs_json: &str,
+    train: &[Vec<f32>],
+    insert: &[Vec<f32>],
+    test: &[Vec<f32>],
+    neighbors: &[Vec<i64>],
+    all_neighbors: &[Vec<i64>],
+    distance: &str,
+    dim: usize,
+) -> PathBuf {
+    let tmp = tempfile::tempdir().expect("Failed to create temp dir");
+    let root = tmp.path().to_path_buf();
+    std::mem::forget(tmp);
+
+    let dataset_dir = root.join("datasets").join(dataset_name);
+    fs::create_dir_all(&dataset_dir).unwrap();
+    fs::create_dir_all(root.join("experiments/configurations")).unwrap();
+    fs::create_dir_all(root.join("results")).unwrap();
+
+    let hdf5_path = dataset_dir.join(format!("{}.hdf5", dataset_name));
+    let file = hdf5::File::create(&hdf5_path).expect("create hdf5 file");
+    let write_f32 = |name: &str, rows: &[Vec<f32>]| {
+        let ds = file
+            .new_dataset::<f32>()
+            .shape((rows.len(), dim))
+            .create(name)
+            .unwrap();
+        let flat: Vec<f32> = rows.iter().flatten().copied().collect();
+        ds.write_raw(&flat).unwrap();
+    };
+    let write_i64 = |name: &str, rows: &[Vec<i64>]| {
+        let cols = rows.first().map(|r| r.len()).unwrap_or(0);
+        let ds = file
+            .new_dataset::<i64>()
+            .shape((rows.len(), cols))
+            .create(name)
+            .unwrap();
+        let flat: Vec<i64> = rows.iter().flatten().copied().collect();
+        ds.write_raw(&flat).unwrap();
+    };
+    write_f32("train", train);
+    write_f32("insert", insert);
+    write_f32("test", test);
+    write_i64("neighbors", neighbors);
+    write_i64("allneighbors", all_neighbors);
+    drop(file);
+
+    let datasets_json = serde_json::json!([{
+        "name": dataset_name,
+        "type": "hdf5",
+        "path": format!("{}/{}.hdf5", dataset_name, dataset_name),
+        "distance": distance,
+        "vector_size": dim,
+        "vector_count": train.len(),
+    }]);
+    fs::write(
+        root.join("datasets/datasets.json"),
+        serde_json::to_string_pretty(&datasets_json).unwrap(),
+    )
+    .unwrap();
+
+    fs::write(
+        root.join("experiments/configurations/test.json"),
+        engine_configs_json,
+    )
+    .unwrap();
+
+    root
+}

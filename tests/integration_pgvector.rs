@@ -985,3 +985,437 @@ fn test_pgvector_exact_match_labels_set_membership() {
     conn.execute("DROP TABLE IF EXISTS ma_exact_test", &[])
         .unwrap();
 }
+
+// ---------------------------------------------------------------------------
+// HDF5 end-to-end: inner product, mixed workload, SVS Vamana
+// ---------------------------------------------------------------------------
+
+/// SVS tests need a server with the `svs` extension on PG_PORT (the stock
+/// pgvector image lacks it), so they run only with PGVECTOR_SVS=1.
+fn svs_enabled(test: &str) -> bool {
+    let enabled = std::env::var("PGVECTOR_SVS").is_ok_and(|v| v == "1");
+    if !enabled {
+        println!(
+            "skipping {}: set PGVECTOR_SVS=1 with an svs-enabled server",
+            test
+        );
+    }
+    enabled
+}
+
+fn brute_force_neighbors_ip(query: &[f32], vectors: &[Vec<f32>], top: usize) -> Vec<i64> {
+    let mut sims: Vec<(i64, f64)> = vectors
+        .iter()
+        .enumerate()
+        .map(|(i, v)| {
+            let dot: f64 = query
+                .iter()
+                .zip(v.iter())
+                .map(|(a, b)| *a as f64 * *b as f64)
+                .sum();
+            (i as i64, dot)
+        })
+        .collect();
+    sims.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+    sims.iter().take(top).map(|(id, _)| *id).collect()
+}
+
+fn brute_force(distance: &str, query: &[f32], vectors: &[Vec<f32>], top: usize) -> Vec<i64> {
+    match distance {
+        "l2" => brute_force_neighbors_l2(query, vectors, top),
+        "cosine" => brute_force_neighbors_cosine(query, vectors, top),
+        "dot" => brute_force_neighbors_ip(query, vectors, top),
+        other => panic!("unsupported distance {}", other),
+    }
+}
+
+/// HDF5 project with `train`/`insert`/`test` plus ground truth against `train`
+/// (`neighbors`) and `train`+`insert` (`allneighbors`), for `engine_configs`.
+fn insert_project(
+    dataset_name: &str,
+    engine_configs: &serde_json::Value,
+    distance: &str,
+    train_count: usize,
+    insert_count: usize,
+    top: usize,
+) -> std::path::PathBuf {
+    let dim = 8;
+    let num_queries = 10;
+    let (_, train) = generate_test_vectors(train_count, dim);
+    let (_, insert) = generate_test_vectors(insert_count, dim);
+    let (_, queries) = generate_test_vectors(num_queries, dim);
+    let merged: Vec<Vec<f32>> = train.iter().chain(insert.iter()).cloned().collect();
+    let neighbors: Vec<Vec<i64>> = queries
+        .iter()
+        .map(|q| brute_force(distance, q, &train, top))
+        .collect();
+    let all_neighbors: Vec<Vec<i64>> = queries
+        .iter()
+        .map(|q| brute_force(distance, q, &merged, top))
+        .collect();
+    common::write_insert_hdf5_project(
+        dataset_name,
+        &serde_json::to_string(engine_configs).unwrap(),
+        &train,
+        &insert,
+        &queries,
+        &neighbors,
+        &all_neighbors,
+        distance,
+        dim,
+    )
+}
+
+/// Run the binary and return its output (stdout is asserted on).
+fn run_pg(
+    root: &std::path::Path,
+    engine: &str,
+    dataset: &str,
+    extra: &[&str],
+) -> std::process::Output {
+    let out = std::process::Command::new(common::binary_path())
+        .args([
+            "--engines",
+            engine,
+            "--datasets",
+            dataset,
+            "--host",
+            PG_HOST,
+            "--skip-if-exists",
+            "false",
+        ])
+        .args(extra)
+        .env("PGVECTOR_PORT", PG_PORT.to_string())
+        .current_dir(root)
+        .output()
+        .expect("run vector-db-benchmark");
+    assert!(
+        out.status.success(),
+        "{} run failed.\nstdout:\n{}\nstderr:\n{}",
+        engine,
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    out
+}
+
+/// `results` object of the engine's (single) search result JSON.
+fn read_results(root: &std::path::Path, engine: &str) -> serde_json::Value {
+    let pattern = glob::Pattern::new(&format!("{}-*-search-*.json", engine)).unwrap();
+    let path = std::fs::read_dir(root.join("results"))
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .find(|p| pattern.matches(&p.file_name().unwrap().to_string_lossy()))
+        .unwrap_or_else(|| panic!("no search result for {}", engine));
+    let v: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+    v["results"].clone()
+}
+
+/// Inner-product datasets map to `<#>` / vector_ip_ops (previously rejected).
+#[test]
+fn test_binary_pgvector_dot() {
+    wait_for_postgres();
+    let configs = serde_json::json!([{
+        "name": "pg-dot", "engine": "pgvector",
+        "search_params": [{"parallel": 1, "top": 5, "search_params": {"hnsw_ef": 400}}],
+        "upload_params": {"parallel": 1, "batch_size": 100}
+    }]);
+    let root = insert_project("dot-test", &configs, "dot", 300, 1, 5);
+    run_pg(&root, "pg-dot", "dot-test", &[]);
+    let recall = read_results(&root, "pg-dot")["mean_recall"]
+        .as_f64()
+        .unwrap();
+    assert!(recall >= 0.9, "pgvector dot recall {:.3} < 0.9", recall);
+}
+
+/// HNSW on a halfvec column, indexed with inner product over a cosine dataset
+/// (normalized on read), built after the load with build settings applied.
+#[test]
+fn test_binary_pgvector_halfvec_ip_after_load() {
+    wait_for_postgres();
+    let configs = serde_json::json!([{
+        "name": "pg-half-ip", "engine": "pgvector",
+        "collection_params": {
+            "data_type": "FLOAT16",
+            "distance": "dot",
+            "index_after_load": true,
+            "maintenance_work_mem": "64MB",
+            "max_parallel_workers": 2
+        },
+        "search_params": [{"parallel": 1, "top": 5, "search_params": {"hnsw_ef": 400}}],
+        "upload_params": {"parallel": 1, "batch_size": 100}
+    }]);
+    let root = insert_project("half-ip-test", &configs, "cosine", 300, 1, 5);
+    let out = run_pg(&root, "pg-half-ip", "half-ip-test", &[]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("hnsw(embedding halfvec_ip_ops)"),
+        "expected a halfvec IP index built after load.\nstdout:\n{}",
+        stdout
+    );
+    let recall = read_results(&root, "pg-half-ip")["mean_recall"]
+        .as_f64()
+        .unwrap();
+    assert!(
+        recall >= 0.9,
+        "pgvector halfvec IP recall {:.3} < 0.9",
+        recall
+    );
+}
+
+/// `--search-duration` recycles queries until the deadline.
+#[test]
+fn test_binary_pgvector_search_duration() {
+    wait_for_postgres();
+    let configs = serde_json::json!([{
+        "name": "pg-duration", "engine": "pgvector",
+        "search_params": [{"parallel": 2, "top": 5, "search_params": {"hnsw_ef": 400}}],
+        "upload_params": {"parallel": 1, "batch_size": 100}
+    }]);
+    let root = insert_project("duration-test", &configs, "l2", 300, 1, 5);
+    run_pg(
+        &root,
+        "pg-duration",
+        "duration-test",
+        &["--search-duration", "2"],
+    );
+    let results = read_results(&root, "pg-duration");
+    // 10 queries, recycled for 2 s: far more searches than queries.
+    let searched = results["requested_queries"].as_u64().unwrap();
+    assert!(
+        searched > 100,
+        "expected recycled queries, got {}",
+        searched
+    );
+    assert!(results["total_time"].as_f64().unwrap() >= 2.0);
+    let recall = results["mean_recall"].as_f64().unwrap();
+    assert!(
+        recall >= 0.9,
+        "pgvector duration recall {:.3} < 0.9",
+        recall
+    );
+}
+
+/// Mixed workload re-upserting corpus vectors (`--update-search-ratio` alone).
+#[test]
+fn test_binary_pgvector_mixed_updates() {
+    wait_for_postgres();
+    let configs = serde_json::json!([{
+        "name": "pg-mixed", "engine": "pgvector",
+        "search_params": [{"parallel": 2, "top": 5, "search_params": {"hnsw_ef": 400}}],
+        "upload_params": {"parallel": 1, "batch_size": 100}
+    }]);
+    let root = insert_project("mixed-test", &configs, "l2", 300, 1, 5);
+    run_pg(
+        &root,
+        "pg-mixed",
+        "mixed-test",
+        &["--update-search-ratio", "1:2"],
+    );
+    let results = read_results(&root, "pg-mixed");
+    assert!(
+        results["update_count"].as_u64().unwrap_or(0) > 0,
+        "expected updates in {}",
+        results
+    );
+    assert_eq!(results["update_search_ratio"], "1:2");
+    let recall = results["mean_recall"].as_f64().unwrap();
+    assert!(recall >= 0.9, "pgvector mixed recall {:.3} < 0.9", recall);
+}
+
+/// Shared `--insert` check: every insert vector is upserted exactly once and
+/// the post-insert pass is scored against `allneighbors`.
+fn assert_insert_post_recall(
+    engine: &str,
+    collection_params: serde_json::Value,
+    search: serde_json::Value,
+    train_count: usize,
+) {
+    let insert_count = 50;
+    let configs = serde_json::json!([{
+        "name": engine, "engine": "pgvector",
+        "collection_params": collection_params,
+        "search_params": [search],
+        "upload_params": {"parallel": 1, "batch_size": 100}
+    }]);
+    let dataset = format!("{}-ds", engine);
+    let root = insert_project(&dataset, &configs, "l2", train_count, insert_count, 5);
+    let out = run_pg(
+        &root,
+        engine,
+        &dataset,
+        &["--update-search-ratio", "1:1", "--insert"],
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("Post-insert recall (allneighbors)"),
+        "post-insert recall phase did not run.\nstdout:\n{}",
+        stdout
+    );
+    let results = read_results(&root, engine);
+    assert_eq!(results["update_count"].as_u64(), Some(insert_count as u64));
+    let recall = results["post_insert_mean_recall"].as_f64().unwrap();
+    assert!(
+        recall >= 0.9,
+        "{} post-insert recall {:.3} < 0.9",
+        engine,
+        recall
+    );
+    assert!(results["post_insert_recall_p10"].is_number());
+}
+
+#[test]
+fn test_binary_pgvector_insert_post_recall() {
+    wait_for_postgres();
+    assert_insert_post_recall(
+        "pg-insert",
+        serde_json::json!({}),
+        serde_json::json!({"parallel": 1, "top": 5, "search_params": {"hnsw_ef": 400}}),
+        300,
+    );
+}
+
+/// SVS Vamana build + search for each metric (cosine also indexed as L2 and IP,
+/// and as halfvec), with the window calibrated to a target precision.
+#[test]
+fn test_binary_pgvector_svs_search_calibration() {
+    if !svs_enabled("test_binary_pgvector_svs_search_calibration") {
+        return;
+    }
+    wait_for_postgres();
+    // (dataset distance, indexed distance override, data_type)
+    for (distance, index_distance, data_type) in [
+        ("l2", None, "FLOAT32"),
+        ("cosine", None, "FLOAT32"),
+        ("cosine", Some("l2"), "FLOAT32"),
+        ("cosine", Some("dot"), "FLOAT32"),
+        ("cosine", Some("dot"), "FLOAT16"),
+        ("dot", None, "FLOAT32"),
+    ] {
+        let engine = format!(
+            "pg-svs-{}-{}-{}",
+            distance,
+            index_distance.unwrap_or("same"),
+            data_type
+        );
+        let mut collection_params = serde_json::json!({
+            "algorithm": "svs-vamana",
+            "data_type": data_type,
+            "svs-vamana_config": {"graph_degree": 32, "build_window_size": 64}
+        });
+        if let Some(d) = index_distance {
+            collection_params["distance"] = d.into();
+        }
+        let configs = serde_json::json!([{
+            "name": engine, "engine": "pgvector",
+            "collection_params": collection_params,
+            "search_params": [{
+                "parallel": 1, "top": 10,
+                "calibration_param": "search_window_size",
+                "calibration_precision": 0.95
+            }],
+            "upload_params": {"parallel": 1, "batch_size": 100}
+        }]);
+        let dataset = format!("{}-ds", engine);
+        let root = insert_project(&dataset, &configs, distance, 500, 1, 10);
+        let out = run_pg(&root, &engine, &dataset, &[]);
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            stdout.contains("Calibrated search_window_size="),
+            "{}: calibration did not converge.\nstdout:\n{}",
+            engine,
+            stdout
+        );
+        let recall = read_results(&root, &engine)["mean_recall"]
+            .as_f64()
+            .unwrap();
+        assert!(recall >= 0.9, "{} recall {:.3} < 0.9", engine, recall);
+    }
+}
+
+/// Inserts into a built Vamana index; fails loudly if the extension rejects writes.
+#[test]
+fn test_binary_pgvector_svs_insert_post_recall() {
+    if !svs_enabled("test_binary_pgvector_svs_insert_post_recall") {
+        return;
+    }
+    wait_for_postgres();
+    assert_insert_post_recall(
+        "pg-svs-insert",
+        serde_json::json!({
+            "algorithm": "svs-vamana",
+            "svs-vamana_config": {"graph_degree": 32, "build_window_size": 64}
+        }),
+        serde_json::json!({"parallel": 1, "top": 5, "search_params": {"search_window_size": 100}}),
+        300,
+    );
+}
+
+/// LVQ and LeanVec builds plus inserts into the compressed index. Both train
+/// their compression on the rows present at build time (LVQ wants >= 10,000).
+#[test]
+fn test_binary_pgvector_svs_compression_insert() {
+    if !svs_enabled("test_binary_pgvector_svs_compression_insert") {
+        return;
+    }
+    wait_for_postgres();
+    // (compression_type, compression_primary, compression_secondary):
+    // LVQ 8-bit without residual, LVQ 4x8, LeanVec 8x8.
+    for (name, ctype, primary, secondary) in [
+        ("lvq8", 2, 8, 0),
+        ("lvq4x8", 2, 4, 8),
+        ("leanvec8x8", 1, 8, 8),
+    ] {
+        assert_insert_post_recall(
+            &format!("pg-svs-{}", name),
+            serde_json::json!({
+                "algorithm": "svs-vamana",
+                "svs-vamana_config": {
+                    "graph_degree": 32,
+                    "build_window_size": 64,
+                    "compression_type": ctype,
+                    "compression_primary": primary,
+                    "compression_secondary": secondary,
+                    // The fixture is isotropic random data, so LeanVec's default
+                    // D/2 projection discards real signal. Ignored under LVQ.
+                    "leanvec_dims": 6
+                }
+            }),
+            serde_json::json!({"parallel": 1, "top": 5, "search_params": {"search_window_size": 200}}),
+            10_000,
+        );
+    }
+}
+
+/// 100 concurrent writers exceed svs's 64 pending-insert slots per database;
+/// rejected writes are retried and counted rather than failing the run.
+#[test]
+fn test_binary_pgvector_svs_concurrent_inserts_retry() {
+    if !svs_enabled("test_binary_pgvector_svs_concurrent_inserts_retry") {
+        return;
+    }
+    wait_for_postgres();
+    let insert_count = 2000;
+    let configs = serde_json::json!([{
+        "name": "pg-svs-concurrent", "engine": "pgvector",
+        "collection_params": {
+            "algorithm": "svs-vamana",
+            "svs-vamana_config": {"graph_degree": 32, "build_window_size": 64}
+        },
+        "search_params": [{"parallel": 100, "top": 5, "search_params": {"search_window_size": 100}}],
+        "upload_params": {"parallel": 1, "batch_size": 100}
+    }]);
+    let root = insert_project("svs-concurrent-ds", &configs, "l2", 2000, insert_count, 5);
+    run_pg(
+        &root,
+        "pg-svs-concurrent",
+        "svs-concurrent-ds",
+        &["--update-search-ratio", "1:1", "--insert"],
+    );
+    let results = read_results(&root, "pg-svs-concurrent");
+    assert_eq!(results["update_count"].as_u64(), Some(insert_count as u64));
+    println!("update_retries={}", results["update_retries"]);
+    assert!(results["update_retries"].is_u64());
+}
