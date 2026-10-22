@@ -445,7 +445,7 @@ pub fn display_mixed_summary(entries: &[SearchEntry]) {
 }
 
 /// Return a sort key for ratio strings: "search" → -1, "U:S" → U/S.
-fn ratio_sort_key(key: &str) -> f64 {
+pub(crate) fn ratio_sort_key(key: &str) -> f64 {
     if key == "search" {
         return -1.0;
     }

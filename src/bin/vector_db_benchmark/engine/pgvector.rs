@@ -109,12 +109,15 @@ struct VamanaConfig {
 /// Session settings applied before an index build after the load.
 #[derive(Debug, Clone, Default, PartialEq)]
 struct BuildSettings {
-    /// `maintenance_work_mem`, as a SQL literal. pgvector HNSW builds much
-    /// faster when the graph fits; SVS does not use it yet.
+    /// `maintenance_work_mem`, as a SQL literal; `None` uses the server's.
+    /// pgvector HNSW builds much faster when the graph fits; SVS does not use
+    /// it yet.
     maintenance_work_mem: Option<String>,
     /// Parallel build workers (`max_parallel_maintenance_workers` and the
-    /// table's `parallel_workers`). The pool itself, `max_parallel_workers`,
-    /// is left to the server: SVS keeps its search threads parked in it.
+    /// table's `parallel_workers`); `None` uses the server's
+    /// `max_parallel_maintenance_workers`. The pool itself,
+    /// `max_parallel_workers`, is left to the server: SVS keeps its search
+    /// threads parked in it.
     max_parallel_workers: Option<u64>,
 }
 
@@ -669,9 +672,20 @@ impl Engine for PgVectorEngine {
         // build is part of the COPY time.
         if self.index_after_load {
             let copy_time = upload_start.elapsed().as_secs_f64();
-            let (_, ops_class) = self.distance_ops(dataset)?;
+            let (distance_op, ops_class) = self.distance_ops(dataset)?;
             let mut conn = self.connect()?;
-            for stmt in build_session_sql(&self.build) {
+            // Without a configured worker count, build with the server's
+            // max_parallel_maintenance_workers (a per-host setting).
+            let workers = match self.build.max_parallel_workers {
+                Some(n) => n,
+                None => conn
+                    .query_one("SHOW max_parallel_maintenance_workers", &[])
+                    .map_err(|e| pg_error_message(&e))?
+                    .get::<_, String>(0)
+                    .parse()
+                    .map_err(|e| format!("Bad max_parallel_maintenance_workers: {}", e))?,
+            };
+            for stmt in build_session_sql(&self.build, workers) {
                 conn.execute(&stmt, &[])
                     .map_err(|e| format!("Failed to apply '{}': {}", stmt, pg_error_message(&e)))?;
             }
@@ -685,6 +699,16 @@ impl Engine for PgVectorEngine {
                 copy_time,
                 build_start.elapsed().as_secs_f64()
             );
+            if matches!(self.index, PgIndex::Vamana(_)) {
+                if let Some(probe) = vectors.first() {
+                    let ready_start = Instant::now();
+                    wait_for_vamana_worker(&mut conn, distance_op, self.vector_type, probe)?;
+                    println!(
+                        "Vamana worker ready after {:.3}s",
+                        ready_start.elapsed().as_secs_f64()
+                    );
+                }
+            }
         }
 
         let upload_time = upload_start.elapsed().as_secs_f64();
@@ -1428,19 +1452,28 @@ fn vamana_index_sql(ops_class: &str, cfg: &VamanaConfig) -> String {
     sql
 }
 
-/// Session settings applied on the build connection before `CREATE INDEX`.
-fn build_session_sql(build: &BuildSettings) -> Vec<String> {
+/// Session settings applied on the build connection before `CREATE INDEX`,
+/// building with `workers` parallel workers. Unset settings keep the server's.
+fn build_session_sql(build: &BuildSettings, workers: u64) -> Vec<String> {
     let mut stmts = Vec::new();
     if let Some(mem) = &build.maintenance_work_mem {
         stmts.push(format!("SET maintenance_work_mem = {}", mem));
     }
-    if let Some(n) = build.max_parallel_workers {
-        // Not `SET max_parallel_workers`: the pool also holds the SVS search
-        // threads (parked parallel workers), so capping it at the build's
-        // size leaves no workers for the build, which then runs serially.
-        stmts.push(format!("SET max_parallel_maintenance_workers = {}", n));
-        stmts.push(format!("ALTER TABLE items SET (parallel_workers = {})", n));
+    // Not `SET max_parallel_workers`: the pool also holds the SVS search
+    // threads (parked parallel workers), so capping it at the build's size
+    // leaves no workers for the build, which then runs serially.
+    if build.max_parallel_workers.is_some() {
+        stmts.push(format!(
+            "SET max_parallel_maintenance_workers = {}",
+            workers
+        ));
     }
+    // HNSW otherwise sizes its workers from the table size, well below
+    // max_parallel_maintenance_workers for a 1M-vector table.
+    stmts.push(format!(
+        "ALTER TABLE items SET (parallel_workers = {})",
+        workers
+    ));
     stmts
 }
 
@@ -1551,6 +1584,47 @@ fn knn_query(
             .collect()
     });
     (ids, query_time)
+}
+
+/// Give up waiting for the vamana worker to serve a new index after this long.
+const VAMANA_READY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// Block until the vamana background worker answers an index scan. Right after
+/// `CREATE INDEX` the worker loads the new index without updating its
+/// heartbeat; once that takes over 3 s (`VAMANA_HEARTBEAT_STALE_MS` in svs
+/// 0.1.0, e.g. a 1M x 1536 float32 index) every scan and insert fails fast
+/// with "background worker unavailable" until the load ends. The wait counts
+/// in the upload time: the index cannot be used before it.
+fn wait_for_vamana_worker(
+    conn: &mut postgres::Client,
+    distance_op: &str,
+    vector_type: VectorType,
+    probe: &[f32],
+) -> Result<(), String> {
+    conn.execute("SET enable_seqscan = off", &[])
+        .map_err(|e| format!("Failed to disable seqscan: {}", pg_error_message(&e)))?;
+    let start = Instant::now();
+    let result = loop {
+        match knn_query(conn, distance_op, vector_type, probe, 1, None).0 {
+            Ok(_) => break Ok(()),
+            Err(e)
+                if pg_error_message(&e).contains("vamana background worker unavailable")
+                    && start.elapsed() < VAMANA_READY_TIMEOUT =>
+            {
+                std::thread::sleep(std::time::Duration::from_millis(200));
+            }
+            Err(e) => {
+                break Err(format!(
+                    "vamana index not searchable after {:.1}s: {}",
+                    start.elapsed().as_secs_f64(),
+                    pg_error_message(&e)
+                ))
+            }
+        }
+    };
+    conn.execute("RESET enable_seqscan", &[])
+        .map_err(|e| format!("Failed to reset enable_seqscan: {}", pg_error_message(&e)))?;
+    result
 }
 
 /// Give up retrying a rejected write after this long.
@@ -2407,7 +2481,7 @@ mod tests {
         assert_eq!(b.maintenance_work_mem.as_deref(), Some("'8GB'"));
         assert_eq!(b.max_parallel_workers, Some(4));
         assert_eq!(
-            build_session_sql(&b),
+            build_session_sql(&b, 4),
             vec![
                 "SET maintenance_work_mem = '8GB'",
                 "SET max_parallel_maintenance_workers = 4",
@@ -2422,7 +2496,11 @@ mod tests {
         assert!(
             parse_build_settings(Some(&cp_extra(json!({"maintenance_work_mem": true})))).is_err()
         );
-        assert!(build_session_sql(&parse_build_settings(None).unwrap()).is_empty());
+        // Server defaults: only the table's worker count is set.
+        assert_eq!(
+            build_session_sql(&parse_build_settings(None).unwrap(), 16),
+            vec!["ALTER TABLE items SET (parallel_workers = 16)"]
+        );
     }
 
     #[test]

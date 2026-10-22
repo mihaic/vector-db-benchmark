@@ -633,8 +633,14 @@ fn run_single_experiment(
                             Some(calibrated)
                         }
                         Err(e) => {
-                            eprintln!("\tCalibration failed: {}", e);
-                            None
+                            // Falling back to the configured default would report
+                            // an uncalibrated operating point as this config's.
+                            let msg = format!("calibration of {} failed: {}", cal_param, e);
+                            eprintln!("\t{}", msg);
+                            if args.exit_on_error {
+                                return Err(msg);
+                            }
+                            continue;
                         }
                     }
                 } else {
@@ -925,6 +931,7 @@ fn run_single_experiment(
             server_metadata_before.as_ref(),
             server_metadata_after.as_ref(),
             args.dump_raw_latencies,
+            args.insert,
         )?;
     }
 
@@ -1020,6 +1027,13 @@ fn calibrate(
         }
 
         let results = engine.search(dataset, &test_params, num_queries)?;
+        // Precision over only the successful subset would steer the search.
+        if results.failed_queries > 0 {
+            return Err(format!(
+                "{} of {} queries failed at {}={}",
+                results.failed_queries, results.requested_queries, calibration_param, current
+            ));
+        }
         let current_precision = results.mean_precision;
 
         println!(
@@ -1069,6 +1083,7 @@ fn save_search_results(
     server_metadata_before: Option<&serde_json::Value>,
     server_metadata_after: Option<&serde_json::Value>,
     dump_raw_latencies: bool,
+    insert: bool,
 ) -> Result<(), String> {
     let timestamp = Local::now().format("%Y-%m-%d-%H-%M-%S");
     let pid = std::process::id();
@@ -1092,6 +1107,13 @@ fn save_search_results(
             "target_qps": search_params.target_qps,
             "duration_seconds": search_params.duration_seconds,
             "max_lateness_ms": search_params.max_lateness_ms,
+            // The calibrated knob, whose value is in `search_params`.
+            "calibration_param": search_params.calibration_param,
+            "calibration_precision": search_params.calibration_precision,
+            // Mixed phase with `--insert` (new points rather than re-upserts).
+            "insert": insert && results.update_search_ratio.is_some(),
+            // Ties this run to the upload file of the same invocation.
+            "pid": pid,
         },
         "results": {
             "total_time": results.total_time,
@@ -1257,6 +1279,7 @@ fn save_upload_results(
             "dataset": dataset_name,
             "parallel": stats.parallel,
             "batch_size": stats.batch_size,
+            "pid": std::process::id(),
         },
         "results": {
             "upload_time": stats.upload_time,

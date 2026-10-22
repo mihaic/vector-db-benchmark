@@ -159,6 +159,13 @@ pub struct Args {
     #[arg(long, value_name = "OUTPUT.svg")]
     pub plot: Option<String>,
 
+    /// Instead of benchmarking, write a Markdown report comparing engines from
+    /// the result files in results/, filtered by --engines and --datasets: one
+    /// table per workload (search-only, mixed, --insert), one row per engine
+    /// (its newest run). Value is the output path, or `-` for stdout.
+    #[arg(long, value_name = "OUTPUT.md")]
+    pub report: Option<String>,
+
     /// Show detailed information when using --describe
     #[arg(long, short)]
     pub verbose: bool,

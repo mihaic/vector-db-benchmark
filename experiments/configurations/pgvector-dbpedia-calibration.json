@@ -7,8 +7,6 @@
             "data_type": "FLOAT32",
             "distance": "dot",
             "index_after_load": true,
-            "maintenance_work_mem": "32GB",
-            "max_parallel_workers": 48,
             "hnsw_config": {
                 "m": 16,
                 "ef_construct": 200
@@ -36,8 +34,6 @@
             "data_type": "FLOAT32",
             "distance": "dot",
             "index_after_load": true,
-            "maintenance_work_mem": "32GB",
-            "max_parallel_workers": 48,
             "svs-vamana_config": {
                 "graph_degree": 32,
                 "build_window_size": 200
@@ -65,8 +61,6 @@
             "data_type": "FLOAT32",
             "distance": "dot",
             "index_after_load": true,
-            "maintenance_work_mem": "32GB",
-            "max_parallel_workers": 48,
             "svs-vamana_config": {
                 "graph_degree": 32,
                 "build_window_size": 200,
@@ -97,8 +91,6 @@
             "data_type": "FLOAT32",
             "distance": "dot",
             "index_after_load": true,
-            "maintenance_work_mem": "32GB",
-            "max_parallel_workers": 48,
             "svs-vamana_config": {
                 "graph_degree": 32,
                 "build_window_size": 200,
@@ -129,8 +121,6 @@
             "data_type": "FLOAT32",
             "distance": "dot",
             "index_after_load": true,
-            "maintenance_work_mem": "32GB",
-            "max_parallel_workers": 48,
             "svs-vamana_config": {
                 "graph_degree": 32,
                 "build_window_size": 200,
@@ -161,8 +151,6 @@
             "data_type": "FLOAT32",
             "distance": "dot",
             "index_after_load": true,
-            "maintenance_work_mem": "32GB",
-            "max_parallel_workers": 48,
             "svs-vamana_config": {
                 "graph_degree": 32,
                 "build_window_size": 200,
@@ -193,8 +181,6 @@
             "data_type": "FLOAT32",
             "distance": "dot",
             "index_after_load": true,
-            "maintenance_work_mem": "32GB",
-            "max_parallel_workers": 48,
             "svs-vamana_config": {
                 "graph_degree": 32,
                 "build_window_size": 200,
@@ -225,8 +211,6 @@
             "data_type": "FLOAT16",
             "distance": "dot",
             "index_after_load": true,
-            "maintenance_work_mem": "32GB",
-            "max_parallel_workers": 48,
             "hnsw_config": {
                 "m": 16,
                 "ef_construct": 200
@@ -254,8 +238,6 @@
             "data_type": "FLOAT16",
             "distance": "dot",
             "index_after_load": true,
-            "maintenance_work_mem": "32GB",
-            "max_parallel_workers": 48,
             "svs-vamana_config": {
                 "graph_degree": 32,
                 "build_window_size": 200
@@ -283,8 +265,6 @@
             "data_type": "FLOAT16",
             "distance": "dot",
             "index_after_load": true,
-            "maintenance_work_mem": "32GB",
-            "max_parallel_workers": 48,
             "svs-vamana_config": {
                 "graph_degree": 32,
                 "build_window_size": 200,
@@ -315,8 +295,6 @@
             "data_type": "FLOAT16",
             "distance": "dot",
             "index_after_load": true,
-            "maintenance_work_mem": "32GB",
-            "max_parallel_workers": 48,
             "svs-vamana_config": {
                 "graph_degree": 32,
                 "build_window_size": 200,
@@ -347,8 +325,6 @@
             "data_type": "FLOAT16",
             "distance": "dot",
             "index_after_load": true,
-            "maintenance_work_mem": "32GB",
-            "max_parallel_workers": 48,
             "svs-vamana_config": {
                 "graph_degree": 32,
                 "build_window_size": 200,
@@ -379,8 +355,6 @@
             "data_type": "FLOAT16",
             "distance": "dot",
             "index_after_load": true,
-            "maintenance_work_mem": "32GB",
-            "max_parallel_workers": 48,
             "svs-vamana_config": {
                 "graph_degree": 32,
                 "build_window_size": 200,
@@ -411,8 +385,6 @@
             "data_type": "FLOAT16",
             "distance": "dot",
             "index_after_load": true,
-            "maintenance_work_mem": "32GB",
-            "max_parallel_workers": 48,
             "svs-vamana_config": {
                 "graph_degree": 32,
                 "build_window_size": 200,

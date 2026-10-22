@@ -4,7 +4,7 @@ __pycache__
 *.pyc
 NOTES.md
 
-results/*
+results*/*
 tools/custom/data.json
 
 *.png

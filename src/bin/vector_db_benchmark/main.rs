@@ -13,6 +13,7 @@ mod latency_digest;
 mod metrics;
 mod plot;
 mod proc_cpu;
+mod report;
 mod summary;
 
 use clap::Parser;
@@ -51,6 +52,15 @@ fn main() {
     // Handle --plot: render a chart from existing results instead of benchmarking.
     if args.plot.is_some() {
         if let Err(e) = plot::export_chart(&args) {
+            eprintln!("Error: {}", e);
+            std::process::exit(1);
+        }
+        return;
+    }
+
+    // Handle --report: summarize existing results instead of benchmarking.
+    if args.report.is_some() {
+        if let Err(e) = report::export_report(&args) {
             eprintln!("Error: {}", e);
             std::process::exit(1);
         }
