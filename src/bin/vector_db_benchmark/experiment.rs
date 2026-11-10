@@ -629,8 +629,14 @@ fn run_single_experiment(
                             Some(calibrated)
                         }
                         Err(e) => {
-                            eprintln!("\tCalibration failed: {}", e);
-                            None
+                            // Falling back to the configured default would report
+                            // an uncalibrated operating point as this config's.
+                            let msg = format!("calibration of {} failed: {}", cal_param, e);
+                            eprintln!("\t{}", msg);
+                            if args.exit_on_error {
+                                return Err(msg);
+                            }
+                            continue;
                         }
                     }
                 } else {
@@ -1016,6 +1022,13 @@ fn calibrate(
         }
 
         let results = engine.search(dataset, &test_params, num_queries)?;
+        // Precision over only the successful subset would steer the search.
+        if results.failed_queries > 0 {
+            return Err(format!(
+                "{} of {} queries failed at {}={}",
+                results.failed_queries, results.requested_queries, calibration_param, current
+            ));
+        }
         let current_precision = results.mean_precision;
 
         println!(
