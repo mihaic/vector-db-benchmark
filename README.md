@@ -197,6 +197,7 @@ Options:
     --describe <TYPE>          Describe available 'datasets' or 'engines'
     -v, --verbose              Verbose output for --describe
     --plot <OUTPUT.svg>        Render a QPS-vs-precision trade-off chart from results/
+    --report <OUTPUT.md>       Write a Markdown report comparing engines from results/ (`-` for stdout)
     -h, --help                 Print help
 ```
 
@@ -241,6 +242,15 @@ Render a QPS-vs-precision trade-off plot (SVG, no dependencies) from existing `*
 ```bash
 # Compare all engines on one dataset
 vector-db-benchmark --plot tradeoff.svg --engines '*' --datasets glove-100-angular
+```
+
+### Reports
+
+Write a Markdown report from the per-run result files in `results/`, filtered by `--engines`/`--datasets`. There is one section per dataset and one table per workload (search only, each mixed `--update-search-ratio`, each `--insert` ratio), with a row per engine: its newest run's search knob, recall, QPS and latency percentiles; update throughput, latency and retries for mixed runs; post-insert recall for `--insert` runs; and the upload (load plus index build) time of the same invocation. Rows follow the order of the `--engines` patterns.
+
+```bash
+vector-db-benchmark --report report.md --datasets dbpedia-openai-1M-1536-angular-100neighbors_insert_100000_42_cosine \
+    --engines dbpedia-cal-pgvector-hnsw-float32 --engines 'dbpedia-cal-pgvector-svs-*'
 ```
 
 ## Client resources & concurrency

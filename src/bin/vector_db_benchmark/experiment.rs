@@ -927,6 +927,7 @@ fn run_single_experiment(
             server_metadata_before.as_ref(),
             server_metadata_after.as_ref(),
             args.dump_raw_latencies,
+            args.insert,
         )?;
     }
 
@@ -1078,6 +1079,7 @@ fn save_search_results(
     server_metadata_before: Option<&serde_json::Value>,
     server_metadata_after: Option<&serde_json::Value>,
     dump_raw_latencies: bool,
+    insert: bool,
 ) -> Result<(), String> {
     let timestamp = Local::now().format("%Y-%m-%d-%H-%M-%S");
     let pid = std::process::id();
@@ -1101,6 +1103,13 @@ fn save_search_results(
             "target_qps": search_params.target_qps,
             "duration_seconds": search_params.duration_seconds,
             "max_lateness_ms": search_params.max_lateness_ms,
+            // The calibrated knob, whose value is in `search_params`.
+            "calibration_param": search_params.calibration_param,
+            "calibration_precision": search_params.calibration_precision,
+            // Mixed phase with `--insert` (new points rather than re-upserts).
+            "insert": insert && results.update_search_ratio.is_some(),
+            // Ties this run to the upload file of the same invocation.
+            "pid": pid,
         },
         "results": {
             "total_time": results.total_time,
@@ -1263,6 +1272,7 @@ fn save_upload_results(
             "dataset": dataset_name,
             "parallel": stats.parallel,
             "batch_size": stats.batch_size,
+            "pid": std::process::id(),
         },
         "results": {
             "upload_time": stats.upload_time,
