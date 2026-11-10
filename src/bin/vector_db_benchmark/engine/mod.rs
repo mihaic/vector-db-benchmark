@@ -134,6 +134,10 @@ pub struct SearchResults {
     pub update_p99_time: Option<f64>,
     pub update_latencies: Option<Vec<f64>>,
     pub update_search_ratio: Option<String>,
+    /// Writes retried after the engine rejected them as over a concurrency
+    /// limit (pgvector + svs); their latency includes the retries. None for
+    /// engines that don't retry.
+    pub update_retries: Option<usize>,
     // Post-insert full-corpus recall (mixed `--insert` benchmark only): a fresh
     // search pass over every query, run once all insert vectors have been
     // ingested, scored against the dataset's `allneighbors` ground truth

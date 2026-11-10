@@ -1,0 +1,111 @@
+[
+    {
+        "name": "pgvector-svs-default",
+        "engine": "pgvector",
+        "connection_params": {},
+        "collection_params": {
+            "algorithm": "svs-vamana",
+            "svs-vamana_config": {
+                "graph_degree": 32,
+                "build_window_size": 200
+            }
+        },
+        "search_params": [
+            {
+                "parallel": 1,
+                "search_params": {
+                    "search_window_size": 64
+                }
+            },
+            {
+                "parallel": 1,
+                "search_params": {
+                    "search_window_size": 128
+                }
+            },
+            {
+                "parallel": 1,
+                "search_params": {
+                    "search_window_size": 256
+                }
+            },
+            {
+                "parallel": 100,
+                "search_params": {
+                    "search_window_size": 64
+                }
+            },
+            {
+                "parallel": 100,
+                "search_params": {
+                    "search_window_size": 128
+                }
+            },
+            {
+                "parallel": 100,
+                "search_params": {
+                    "search_window_size": 256
+                }
+            }
+        ],
+        "upload_params": {
+            "parallel": 16,
+            "batch_size": 1024
+        }
+    },
+    {
+        "name": "pgvector-svs-normalize-cosine",
+        "engine": "pgvector",
+        "connection_params": {},
+        "collection_params": {
+            "algorithm": "svs-vamana",
+            "normalize_cosine": true,
+            "svs-vamana_config": {
+                "graph_degree": 32,
+                "build_window_size": 200
+            }
+        },
+        "search_params": [
+            {
+                "parallel": 1,
+                "search_params": {
+                    "search_window_size": 64
+                }
+            },
+            {
+                "parallel": 1,
+                "search_params": {
+                    "search_window_size": 128
+                }
+            },
+            {
+                "parallel": 1,
+                "search_params": {
+                    "search_window_size": 256
+                }
+            },
+            {
+                "parallel": 100,
+                "search_params": {
+                    "search_window_size": 64
+                }
+            },
+            {
+                "parallel": 100,
+                "search_params": {
+                    "search_window_size": 128
+                }
+            },
+            {
+                "parallel": 100,
+                "search_params": {
+                    "search_window_size": 256
+                }
+            }
+        ],
+        "upload_params": {
+            "parallel": 16,
+            "batch_size": 1024
+        }
+    }
+]

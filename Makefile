@@ -136,6 +136,22 @@ integration-test-pgvector:
 	docker compose -f tests/docker-compose.test.yml down ; \
 	exit $$EXIT_CODE
 
+.PHONY: integration-test-pgvector-svs
+integration-test-pgvector-svs:
+ifdef PGSVS_BIN
+	@echo "=== Starting svs-enabled PostgreSQL from $(PGSVS_BIN) ==="
+	PGSVS_BIN=$(PGSVS_BIN) tests/pgsvs-server.sh start
+	@echo "=== Running PgVector SVS integration tests ==="
+	PGVECTOR_SVS=1 PGVECTOR_PORT=5433 cargo test --test integration_pgvector --release svs -- --nocapture --test-threads=1; \
+	EXIT_CODE=$$?; \
+	echo "=== Stopping svs-enabled PostgreSQL ===" ; \
+	PGSVS_BIN=$(PGSVS_BIN) tests/pgsvs-server.sh stop ; \
+	exit $$EXIT_CODE
+else
+	@echo "=== Running PgVector SVS integration tests (svs-enabled PostgreSQL already on port 5433) ==="
+	PGVECTOR_SVS=1 PGVECTOR_PORT=5433 cargo test --test integration_pgvector --release svs -- --nocapture --test-threads=1
+endif
+
 .PHONY: integration-test-qdrant
 integration-test-qdrant:
 	@echo "=== Starting Qdrant v1.13.4 for integration tests ==="
@@ -360,6 +376,8 @@ help:
 	@echo "  make integration-test-elasticsearch   - Elasticsearch 8.10.2"
 	@echo "  make integration-test-opensearch      - OpenSearch 2.19.2"
 	@echo "  make integration-test-pgvector        - PgVector (PostgreSQL 16)"
+	@echo "  make integration-test-pgvector-svs    - PgVector SVS Vamana (PGSVS_BIN=<pg bin dir> starts a local"
+	@echo "                                          server; otherwise uses one already on :5433)"
 	@echo "  make integration-test-qdrant          - Qdrant v1.13.4"
 	@echo "  make integration-test-weaviate        - Weaviate 1.28.9"
 	@echo "  make integration-test-milvus          - Milvus 2.5.6"
