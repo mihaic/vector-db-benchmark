@@ -126,7 +126,7 @@ pub struct Args {
     pub target_qps: f64,
 
     /// Measured search duration in seconds. With --target-qps this is open-loop;
-    /// without it Redis and Vertex run unrestricted closed-loop for this long.
+    /// without it Redis, Vertex and Valkey run unrestricted closed-loop for this long.
     #[arg(long, default_value = "0.0")]
     pub search_duration: f64,
 

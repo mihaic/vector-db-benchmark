@@ -1,0 +1,198 @@
+[
+  {
+    "name": "valkey-svs-none",
+    "engine": "valkey",
+    "connection_params": {},
+    "collection_params": {
+      "algorithm": "svs-vamana",
+      "data_type": "FLOAT32",
+      "svs-vamana_config": {
+        "GRAPH_MAX_DEGREE": 64,
+        "CONSTRUCTION_WINDOW_SIZE": 128
+      }
+    },
+    "search_params": [
+      {
+        "parallel": 100,
+        "top": 10,
+        "search_params": {
+          "ef": 32
+        }
+      },
+      {
+        "parallel": 100,
+        "top": 10,
+        "search_params": {
+          "ef": 64
+        }
+      },
+      {
+        "parallel": 100,
+        "top": 10,
+        "search_params": {
+          "ef": 128
+        }
+      },
+      {
+        "parallel": 100,
+        "top": 10,
+        "search_params": {
+          "ef": 256
+        }
+      }
+    ],
+    "upload_params": {
+      "parallel": 100,
+      "data_type": "FLOAT32",
+      "algorithm": "svs-vamana"
+    }
+  },
+  {
+    "name": "valkey-svs-sq8",
+    "engine": "valkey",
+    "connection_params": {},
+    "collection_params": {
+      "algorithm": "svs-vamana",
+      "data_type": "FLOAT32",
+      "svs-vamana_config": {
+        "GRAPH_MAX_DEGREE": 64,
+        "CONSTRUCTION_WINDOW_SIZE": 128,
+        "compression": "SQ8"
+      }
+    },
+    "search_params": [
+      {
+        "parallel": 100,
+        "top": 10,
+        "search_params": {
+          "ef": 32
+        }
+      },
+      {
+        "parallel": 100,
+        "top": 10,
+        "search_params": {
+          "ef": 64
+        }
+      },
+      {
+        "parallel": 100,
+        "top": 10,
+        "search_params": {
+          "ef": 128
+        }
+      },
+      {
+        "parallel": 100,
+        "top": 10,
+        "search_params": {
+          "ef": 256
+        }
+      }
+    ],
+    "upload_params": {
+      "parallel": 100,
+      "data_type": "FLOAT32",
+      "algorithm": "svs-vamana"
+    }
+  },
+  {
+    "name": "valkey-svs-lvq4x8",
+    "engine": "valkey",
+    "connection_params": {},
+    "collection_params": {
+      "algorithm": "svs-vamana",
+      "data_type": "FLOAT32",
+      "svs-vamana_config": {
+        "GRAPH_MAX_DEGREE": 64,
+        "CONSTRUCTION_WINDOW_SIZE": 128,
+        "compression": "LVQ4X8"
+      }
+    },
+    "search_params": [
+      {
+        "parallel": 100,
+        "top": 10,
+        "search_params": {
+          "ef": 32
+        }
+      },
+      {
+        "parallel": 100,
+        "top": 10,
+        "search_params": {
+          "ef": 64
+        }
+      },
+      {
+        "parallel": 100,
+        "top": 10,
+        "search_params": {
+          "ef": 128
+        }
+      },
+      {
+        "parallel": 100,
+        "top": 10,
+        "search_params": {
+          "ef": 256
+        }
+      }
+    ],
+    "upload_params": {
+      "parallel": 100,
+      "data_type": "FLOAT32",
+      "algorithm": "svs-vamana"
+    }
+  },
+  {
+    "name": "valkey-svs-leanvec4x8",
+    "engine": "valkey",
+    "connection_params": {},
+    "collection_params": {
+      "algorithm": "svs-vamana",
+      "data_type": "FLOAT32",
+      "svs-vamana_config": {
+        "GRAPH_MAX_DEGREE": 64,
+        "CONSTRUCTION_WINDOW_SIZE": 128,
+        "compression": "LEANVEC4X8",
+        "REDUCE": 192
+      }
+    },
+    "search_params": [
+      {
+        "parallel": 100,
+        "top": 10,
+        "search_params": {
+          "ef": 32
+        }
+      },
+      {
+        "parallel": 100,
+        "top": 10,
+        "search_params": {
+          "ef": 64
+        }
+      },
+      {
+        "parallel": 100,
+        "top": 10,
+        "search_params": {
+          "ef": 128
+        }
+      },
+      {
+        "parallel": 100,
+        "top": 10,
+        "search_params": {
+          "ef": 256
+        }
+      }
+    ],
+    "upload_params": {
+      "parallel": 100,
+      "data_type": "FLOAT32",
+      "algorithm": "svs-vamana"
+    }
+  }
+]

@@ -173,12 +173,13 @@ pub fn run(args: &Args) -> Result<(), String> {
             .iter()
             .filter_map(|(name, config)| {
                 let engine_type = config.engine.as_deref().unwrap_or("unknown");
-                (!matches!(engine_type, "redis" | "vertex")).then_some(name.as_str())
+                (!supports_bounded_search(engine_type, args.target_qps > 0.0))
+                    .then_some(name.as_str())
             })
             .collect();
         if !unsupported.is_empty() {
             return Err(format!(
-                "duration-bounded search currently supports Redis and Vertex only; unsupported: {}",
+                "duration-bounded search currently supports Redis and Vertex (and Valkey without --target-qps) only; unsupported: {}",
                 unsupported.join(", ")
             ));
         }
@@ -1291,10 +1292,21 @@ fn save_upload_results(
     Ok(())
 }
 
+/// Whether an engine supports `--search-duration` (closed-loop) and, when
+/// `open_loop` is set, `--target-qps`. Valkey supports closed-loop only.
+fn supports_bounded_search(engine_type: &str, open_loop: bool) -> bool {
+    match engine_type {
+        "redis" | "vertex" => true,
+        "valkey" => !open_loop,
+        _ => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::parse_update_search_ratio;
     use super::run_with_search_watchdog;
+    use super::supports_bounded_search;
     use crate::cli::Args;
     use crate::engine::UpdateSearchRatio;
     use clap::Parser;
@@ -1318,6 +1330,15 @@ mod tests {
             err.contains("--insert does not support --search-duration"),
             "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    fn bounded_search_engine_gate() {
+        assert!(supports_bounded_search("redis", true));
+        assert!(supports_bounded_search("vertex", true));
+        assert!(supports_bounded_search("valkey", false));
+        assert!(!supports_bounded_search("valkey", true));
+        assert!(!supports_bounded_search("qdrant", false));
     }
 
     // Watchdog disabled (timeout <= 0, non-finite): must run `f` inline on the

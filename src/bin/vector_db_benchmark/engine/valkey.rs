@@ -45,6 +45,8 @@ pub struct ValkeyEngineConfig {
     pub ef_construction: i64,
     pub data_type: String,
     pub algorithm: String,
+    /// SVS_VAMANA build params; `None` unless `algorithm` is SVS.
+    pub svs: Option<ValkeySvsConfig>,
     pub batch_size: usize,
     pub parallel: usize,
     pub skip_vector_index: bool,
@@ -66,6 +68,58 @@ pub struct ValkeyEngineConfig {
     /// Per-config key prefix (`"<config>:"`, issue #151-4). Each config owns a
     /// disjoint keyspace; teardown is a prefix-scoped SCAN+UNLINK (no DD flag).
     pub key_prefix: String,
+}
+
+/// SVS_VAMANA build params from `collection_params.svs-vamana_config` (the
+/// block the Redis engine reads). Unset values are left to the server
+/// default, except the graph degree and construction window, which derive
+/// from the HNSW `M`*2 / `EF_CONSTRUCTION` as in the Redis engine.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ValkeySvsConfig {
+    pub graph_max_degree: Option<i64>,
+    pub construction_window_size: Option<i64>,
+    /// Index default search window; per-query it is overridden by `EF_RUNTIME`.
+    pub search_window_size: Option<i64>,
+    pub alpha: Option<f64>,
+    /// `NONE`, `FP16`, `SQ8`, `LVQ*` or `LEANVEC*` (LVQ/LeanVec need the
+    /// prebuilt SVS C API build of valkey-search).
+    pub compression: Option<String>,
+    /// LeanVec reduced dimension count.
+    pub reduce: Option<i64>,
+    /// Vectors held uncompressed before SQ8/LVQ/LeanVec conversion.
+    pub training_threshold: Option<i64>,
+}
+
+impl ValkeySvsConfig {
+    fn from_block(block: Option<&serde_json::Map<String, serde_json::Value>>) -> Self {
+        // Keys are matched case-insensitively (`compression` and `COMPRESSION`
+        // both appear in existing configs).
+        let get = |key: &str| {
+            block.and_then(|b| {
+                b.iter()
+                    .find(|(k, _)| k.eq_ignore_ascii_case(key))
+                    .map(|(_, v)| v)
+            })
+        };
+        let int = |key: &str| get(key).and_then(|v| v.as_i64());
+        Self {
+            graph_max_degree: int("GRAPH_MAX_DEGREE"),
+            construction_window_size: int("CONSTRUCTION_WINDOW_SIZE"),
+            search_window_size: int("SEARCH_WINDOW_SIZE"),
+            alpha: get("ALPHA").and_then(|v| v.as_f64()),
+            compression: get("COMPRESSION")
+                .and_then(|v| v.as_str())
+                .map(|s| s.trim().to_uppercase())
+                .filter(|s| !s.is_empty()),
+            reduce: int("REDUCE"),
+            training_threshold: int("TRAINING_THRESHOLD"),
+        }
+    }
+}
+
+/// True when the configured algorithm is SVS (`svs-vamana`, `SVS_VAMANA`, `svs`).
+fn is_svs(algorithm: &str) -> bool {
+    algorithm.to_uppercase().contains("SVS")
 }
 
 pub struct ValkeyEngine {
@@ -92,18 +146,47 @@ impl ValkeyEngine {
             .map(|h| (h.m.unwrap_or(16), h.ef_construction.unwrap_or(128)))
             .unwrap_or((16, 128));
 
+        // Untyped `collection_params` catch-all: SVS configs nest `algorithm`,
+        // `data_type` and the `svs-vamana_config` block here.
+        let cp_extra = engine_config
+            .collection_params
+            .as_ref()
+            .and_then(|cp| cp.extra.as_ref());
+        let cp_str = |key: &str| {
+            cp_extra
+                .and_then(|e| e.get(key))
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+        };
+        let up_str = |key: &str| {
+            engine_config
+                .upload_params
+                .as_ref()
+                .and_then(|p| p.get(key))
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+        };
+
+        // algorithm: top-level > collection_params > upload_params.
         let algorithm = engine_config
             .algorithm
             .clone()
+            .or_else(|| cp_str("algorithm"))
+            .or_else(|| up_str("algorithm"))
             .unwrap_or_else(|| "hnsw".to_string());
 
-        let data_type = engine_config
-            .upload_params
-            .as_ref()
-            .and_then(|p| p.get("data_type"))
-            .and_then(|v| v.as_str())
-            .unwrap_or("FLOAT32")
-            .to_string();
+        // data_type: upload_params > collection_params.
+        let data_type = up_str("data_type")
+            .or_else(|| cp_str("data_type"))
+            .unwrap_or_else(|| "FLOAT32".to_string());
+
+        let svs = is_svs(&algorithm).then(|| {
+            ValkeySvsConfig::from_block(
+                cp_extra
+                    .and_then(|e| e.get("svs-vamana_config"))
+                    .and_then(|v| v.as_object()),
+            )
+        });
 
         let parallel = engine_config
             .upload_params
@@ -128,6 +211,7 @@ impl ValkeyEngine {
                 ef_construction,
                 data_type,
                 algorithm,
+                svs,
                 batch_size,
                 parallel,
                 skip_vector_index: engine_config.skip_vector_index,
@@ -194,19 +278,15 @@ impl ValkeyEngine {
 
         cmd.arg("SCHEMA");
 
-        // Vector field with HNSW params
+        // Vector field (HNSW or SVS_VAMANA).
         // Skipped when skip_vector_index is set (filter-only benchmark)
         if !self.config.skip_vector_index {
-            let num_attrs = 6 + 2 + 2; // TYPE+DIM+DISTANCE_METRIC + M + EF_CONSTRUCTION
-            cmd.arg("vector")
-                .arg("VECTOR")
-                .arg(self.config.algorithm.to_uppercase())
-                .arg(num_attrs);
-            cmd.arg("TYPE").arg(&self.config.data_type);
-            cmd.arg("DIM").arg(vector_size);
-            cmd.arg("DISTANCE_METRIC").arg(distance_metric);
-            cmd.arg("M").arg(self.config.m);
-            cmd.arg("EF_CONSTRUCTION").arg(self.config.ef_construction);
+            cmd.arg("vector").arg("VECTOR");
+            cmd.arg(vector_field_args(
+                &self.config,
+                vector_size,
+                distance_metric,
+            ));
         }
 
         // Add schema fields from dataset config for filtering.
@@ -733,24 +813,7 @@ fn upload_batch_internal(
 
     for i in 0..ids.len() {
         let key = format!("{}{}", config.key_prefix, ids[i]);
-        let vec_bytes: Vec<u8> = match config.data_type.as_str() {
-            "FLOAT64" => vectors[i]
-                .iter()
-                .map(|&f| f as f64)
-                .flat_map(|f| f.to_le_bytes())
-                .collect(),
-            "FLOAT16" => vectors[i]
-                .iter()
-                .map(|&f| half::f16::from_f32(f).to_bits())
-                .flat_map(|v| v.to_le_bytes())
-                .collect(),
-            "BFLOAT16" => vectors[i]
-                .iter()
-                .map(|&f| half::bf16::from_f32(f).to_bits())
-                .flat_map(|v| v.to_le_bytes())
-                .collect(),
-            _ => vectors[i].iter().flat_map(|f| f.to_le_bytes()).collect(),
-        };
+        let vec_bytes: Vec<u8> = encode_vector(&config.data_type, &vectors[i]);
 
         let mut fields: Vec<(Vec<u8>, Vec<u8>)> = vec![("vector".as_bytes().to_vec(), vec_bytes)];
 
@@ -869,6 +932,77 @@ enum FilterParamValue {
 }
 
 type ParsedFilter = (String, HashMap<String, FilterParamValue>);
+
+/// Build the `VECTOR` field arguments after `vector VECTOR`: the algorithm
+/// token, the attribute count, and the attributes.
+///
+/// SVS_VAMANA takes GRAPH_MAX_DEGREE / CONSTRUCTION_WINDOW_SIZE in place of
+/// HNSW's M / EF_CONSTRUCTION (derived from them when unset, as in the Redis
+/// engine), plus optional SEARCH_WINDOW_SIZE, ALPHA, COMPRESSION, REDUCE and
+/// TRAINING_THRESHOLD. Its query-time window is EF_RUNTIME, as for HNSW.
+fn vector_field_args(config: &ValkeyEngineConfig, dim: i64, distance_metric: &str) -> Vec<String> {
+    let mut attrs: Vec<(&str, String)> = vec![
+        ("TYPE", config.data_type.clone()),
+        ("DIM", dim.to_string()),
+        ("DISTANCE_METRIC", distance_metric.to_string()),
+    ];
+    let algorithm = match &config.svs {
+        Some(svs) => {
+            attrs.push((
+                "GRAPH_MAX_DEGREE",
+                svs.graph_max_degree.unwrap_or(config.m * 2).to_string(),
+            ));
+            attrs.push((
+                "CONSTRUCTION_WINDOW_SIZE",
+                svs.construction_window_size
+                    .unwrap_or(config.ef_construction)
+                    .to_string(),
+            ));
+            let optional = [
+                (
+                    "SEARCH_WINDOW_SIZE",
+                    svs.search_window_size.map(|v| v.to_string()),
+                ),
+                ("ALPHA", svs.alpha.map(|v| v.to_string())),
+                ("COMPRESSION", svs.compression.clone()),
+                ("REDUCE", svs.reduce.map(|v| v.to_string())),
+                (
+                    "TRAINING_THRESHOLD",
+                    svs.training_threshold.map(|v| v.to_string()),
+                ),
+            ];
+            attrs.extend(optional.into_iter().filter_map(|(k, v)| v.map(|v| (k, v))));
+            "SVS_VAMANA".to_string()
+        }
+        None => {
+            attrs.push(("M", config.m.to_string()));
+            attrs.push(("EF_CONSTRUCTION", config.ef_construction.to_string()));
+            config.algorithm.to_uppercase()
+        }
+    };
+    let mut args = vec![algorithm, (attrs.len() * 2).to_string()];
+    for (k, v) in attrs {
+        args.push(k.to_string());
+        args.push(v);
+    }
+    args
+}
+
+/// Resolve the runtime search window bound as `$EF` (sent as EF_RUNTIME).
+/// Calibration writes `search_params.ef` for `"ef"`, but SVS configs calibrate
+/// `"SEARCH_WINDOW_SIZE"`, which lands in the `extra` catch-all.
+fn resolve_ef(params: &SearchParams) -> i64 {
+    let inner = params.search_params.as_ref();
+    inner
+        .and_then(|sp| sp.ef)
+        .or_else(|| {
+            inner
+                .and_then(|sp| sp.extra.as_ref())
+                .and_then(|e| e.get("SEARCH_WINDOW_SIZE"))
+                .and_then(|v| v.as_i64())
+        })
+        .unwrap_or(64)
+}
 
 /// Map a dataset distance name to the Valkey Search `DISTANCE_METRIC` value.
 /// Unknown metrics default to `COSINE` (matches the historical inline behavior).
@@ -1305,12 +1439,31 @@ fn build_knn_query_str(filter: Option<&ParsedFilter>) -> String {
     )
 }
 
-/// Encode a query vector to the FLOAT32 little-endian blob Valkey expects.
+/// Encode a vector as the little-endian blob of the index `TYPE`. Used for
+/// both HSET uploads and FT.SEARCH query blobs: Valkey Search requires the
+/// query blob to match the index element size (e.g. 2 bytes for FLOAT16).
 ///
 /// Kept as a standalone fn so the caller can precompute all query blobs BEFORE
 /// the timed window (client work, not server latency).
-fn encode_query_vector(query_vector: &[f32]) -> Vec<u8> {
-    query_vector.iter().flat_map(|f| f.to_le_bytes()).collect()
+fn encode_vector(data_type: &str, vector: &[f32]) -> Vec<u8> {
+    match data_type {
+        "FLOAT64" => vector
+            .iter()
+            .map(|&f| f as f64)
+            .flat_map(|f| f.to_le_bytes())
+            .collect(),
+        "FLOAT16" => vector
+            .iter()
+            .map(|&f| half::f16::from_f32(f).to_bits())
+            .flat_map(|v| v.to_le_bytes())
+            .collect(),
+        "BFLOAT16" => vector
+            .iter()
+            .map(|&f| half::bf16::from_f32(f).to_bits())
+            .flat_map(|v| v.to_le_bytes())
+            .collect(),
+        _ => vector.iter().flat_map(|f| f.to_le_bytes()).collect(),
+    }
 }
 
 /// Execute a Valkey FT.SEARCH KNN query, return (id, score) pairs.
@@ -1332,16 +1485,30 @@ fn ft_search_knn(
     filter: Option<&ParsedFilter>,
 ) -> Result<Vec<(i64, f64)>, String> {
     // Valkey Search: DIALECT 2 only, no SORTBY on computed fields
+    // Diagnostic: VDBB_VALKEY_REPLY=nocontent returns keys only (NOCONTENT);
+    // VDBB_VALKEY_REPLY=count returns only the count (LIMIT 0 0), while the
+    // search still runs with K=top. Default: keys plus vector_score.
+    static REPLY_MODE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    let reply_mode = REPLY_MODE
+        .get_or_init(|| std::env::var("VDBB_VALKEY_REPLY").unwrap_or_default())
+        .as_str();
     let mut cmd = redis::cmd("FT.SEARCH");
-    cmd.arg(index_name)
-        .arg(query_str)
-        .arg("LIMIT")
-        .arg(0)
-        .arg(top)
-        .arg("RETURN")
-        .arg(1)
-        .arg("vector_score")
-        .arg("DIALECT")
+    cmd.arg(index_name).arg(query_str).arg("LIMIT").arg(0);
+    match reply_mode {
+        "count" => {
+            cmd.arg(0);
+        }
+        "nocontent" => {
+            cmd.arg(top).arg("NOCONTENT");
+        }
+        "returnid" => {
+            cmd.arg(top).arg("RETURN").arg(1).arg("id");
+        }
+        _ => {
+            cmd.arg(top).arg("RETURN").arg(1).arg("vector_score");
+        }
+    }
+    cmd.arg("DIALECT")
         .arg(2)
         .arg("TIMEOUT")
         .arg(query_timeout);
@@ -1375,7 +1542,16 @@ fn ft_search_knn(
         .query(conn)
         .map_err(|e| format!("FT.SEARCH error: {}", e))?;
 
-    parse_ft_search_response(&response)
+    match (reply_mode, &response) {
+        ("count", _) => Ok(Vec::new()),
+        // RESP2 NOCONTENT reply: [count, key, key, ...] with no field arrays.
+        ("nocontent", redis::Value::Array(items)) => Ok(items
+            .iter()
+            .skip(1)
+            .map(|v| (value_as_string(v).map(|s| doc_key_to_id(&s)).unwrap_or(0), 0.0))
+            .collect()),
+        _ => parse_ft_search_response(&response),
+    }
 }
 
 /// Parse an FT.SEARCH reply under EITHER protocol:
@@ -1524,24 +1700,7 @@ fn hset_single(
     metadata: Option<&MetadataItem>,
 ) -> Result<(), String> {
     let key = format!("{}{}", config.key_prefix, id);
-    let vec_bytes: Vec<u8> = match config.data_type.as_str() {
-        "FLOAT64" => vector
-            .iter()
-            .map(|&f| f as f64)
-            .flat_map(|f| f.to_le_bytes())
-            .collect(),
-        "FLOAT16" => vector
-            .iter()
-            .map(|&f| half::f16::from_f32(f).to_bits())
-            .flat_map(|v| v.to_le_bytes())
-            .collect(),
-        "BFLOAT16" => vector
-            .iter()
-            .map(|&f| half::bf16::from_f32(f).to_bits())
-            .flat_map(|v| v.to_le_bytes())
-            .collect(),
-        _ => vector.iter().flat_map(|f| f.to_le_bytes()).collect(),
-    };
+    let vec_bytes: Vec<u8> = encode_vector(&config.data_type, vector);
 
     let mut cmd = redis::cmd("HSET");
     cmd.arg(key.as_str()).arg("vector").arg(&vec_bytes[..]);
@@ -1652,6 +1811,11 @@ impl Engine for ValkeyEngine {
 
         if self.config.skip_vector_index {
             println!("Skipping vector index (filter-only mode)");
+        } else if let Some(svs) = &self.config.svs {
+            println!(
+                "Using algorithm SVS_VAMANA with config {:?} (M {}, EF_CONSTRUCTION {})",
+                svs, self.config.m, self.config.ef_construction
+            );
         } else {
             println!(
                 "Using algorithm {} with config {{'M': {}, 'EF_CONSTRUCTION': {}}}",
@@ -1759,11 +1923,7 @@ impl Engine for ValkeyEngine {
             redis_utils::ensure_index_exists(&mut conn, &self.config.index_name)?;
         }
 
-        let ef = params
-            .search_params
-            .as_ref()
-            .and_then(|sp| sp.ef)
-            .unwrap_or(64);
+        let ef = resolve_ef(params);
         let parallel = params.parallel.unwrap_or(1) as usize;
         let hybrid_policy = std::env::var("VALKEY_HYBRID_POLICY").unwrap_or_default();
         // Valkey Search caps TIMEOUT at 60000ms
@@ -1785,19 +1945,31 @@ impl Engine for ValkeyEngine {
             .collect();
 
         let explicit_top: Option<usize> = params.top.map(|t| t as usize);
-        let num_to_run = if num_queries > 0 {
-            (num_queries as usize).min(queries.len())
+        if params.target_qps.is_some() {
+            return Err("open-loop target_qps is not supported by the Valkey engine".to_string());
+        }
+        // Closed-loop duration mode recycles queries (`idx % query_count`) until
+        // the deadline; otherwise each query runs once.
+        let closed_loop_duration = crate::engine::closed_loop_duration(params)?;
+        let query_count = queries.len();
+        let num_to_run = if closed_loop_duration.is_some() {
+            usize::MAX
+        } else if num_queries > 0 {
+            (num_queries as usize).min(query_count)
         } else {
-            queries.len()
+            query_count
         };
+        let sample_capacity = num_to_run.min(query_count);
 
         // Precompute client-side request construction BEFORE the timed region so
         // the per-query window wraps ONLY the RPC round-trip + reply parse
         // (matching pgvector/qdrant). Encoding the FLOAT32 blob and formatting
         // the query string are client work, not server latency. Shared read-only
         // across workers.
-        let encoded_queries: Vec<Vec<u8>> =
-            queries.iter().map(|q| encode_query_vector(q)).collect();
+        let encoded_queries: Vec<Vec<u8>> = queries
+            .iter()
+            .map(|q| encode_vector(&self.config.data_type, q))
+            .collect();
         let query_strs: Vec<String> = parsed_filters
             .iter()
             .map(|f| build_knn_query_str(f.as_ref()))
@@ -1808,7 +1980,11 @@ impl Engine for ValkeyEngine {
         // order-independent so results are unchanged; work counter uses Relaxed.
         let query_idx = Arc::new(AtomicUsize::new(0));
 
-        let pb = self.create_progress_bar(num_to_run);
+        let pb = self.create_progress_bar(if closed_loop_duration.is_some() {
+            0
+        } else {
+            num_to_run
+        });
 
         // Barrier-synchronized start so connection setup AND the cold first query
         // fall OUTSIDE the measured window (mirrors redis.rs/vertex.rs). Every
@@ -1821,11 +1997,11 @@ impl Engine for ValkeyEngine {
         let go = Arc::new(std::sync::Barrier::new(parallel + 1));
         let start_cell = Arc::new(std::sync::OnceLock::<Instant>::new());
 
-        let mut times: Vec<f64> = Vec::with_capacity(num_to_run);
-        let mut precs: Vec<f64> = Vec::with_capacity(num_to_run);
-        let mut recs: Vec<f64> = Vec::with_capacity(num_to_run);
-        let mut mrr_vals: Vec<f64> = Vec::with_capacity(num_to_run);
-        let mut ndcg_vals: Vec<f64> = Vec::with_capacity(num_to_run);
+        let mut times: Vec<f64> = Vec::with_capacity(sample_capacity);
+        let mut precs: Vec<f64> = Vec::with_capacity(sample_capacity);
+        let mut recs: Vec<f64> = Vec::with_capacity(sample_capacity);
+        let mut mrr_vals: Vec<f64> = Vec::with_capacity(sample_capacity);
+        let mut ndcg_vals: Vec<f64> = Vec::with_capacity(sample_capacity);
 
         // Resolve the per-config index name once (not per query / per worker).
         let index_name = self.config.index_name.clone();
@@ -1845,6 +2021,7 @@ impl Engine for ValkeyEngine {
                 let index_name = index_name.as_str();
                 let ready = Arc::clone(&ready);
                 let go = Arc::clone(&go);
+                let start_cell = Arc::clone(&start_cell);
                 let pb = &pb;
 
                 handles.push(s.spawn(move || {
@@ -1910,12 +2087,20 @@ impl Engine for ValkeyEngine {
                     // stamps the shared measurement start and releases everyone.
                     ready.wait();
                     go.wait();
+                    let start_time = *start_cell.get().unwrap();
 
                     loop {
-                        let idx = query_idx.fetch_add(1, Ordering::Relaxed);
-                        if idx >= num_to_run {
+                        if closed_loop_duration
+                            .map(|duration| Instant::now() >= start_time + duration)
+                            .unwrap_or(false)
+                        {
                             break;
                         }
+                        let fetched = query_idx.fetch_add(1, Ordering::Relaxed);
+                        if fetched >= num_to_run {
+                            break;
+                        }
+                        let idx = fetched % query_count;
 
                         let top = explicit_top.unwrap_or_else(|| {
                             let n = neighbors[idx].len();
@@ -2015,8 +2200,17 @@ impl Engine for ValkeyEngine {
         )?;
 
         let top = explicit_top.unwrap_or_else(|| neighbors.first().map(|n| n.len()).unwrap_or(10));
+        let attempted_queries = query_idx.load(Ordering::Relaxed).min(num_to_run);
         crate::engine::compute_search_stats(
-            &times, &precs, &recs, &mrr_vals, &ndcg_vals, total_time, top, parallel, num_to_run,
+            &times,
+            &precs,
+            &recs,
+            &mrr_vals,
+            &ndcg_vals,
+            total_time,
+            top,
+            parallel,
+            attempted_queries,
         )
     }
 
@@ -2042,11 +2236,7 @@ impl Engine for ValkeyEngine {
             redis_utils::ensure_index_exists(&mut conn, &self.config.index_name)?;
         }
 
-        let ef = params
-            .search_params
-            .as_ref()
-            .and_then(|sp| sp.ef)
-            .unwrap_or(64);
+        let ef = resolve_ef(params);
         let parallel = params.parallel.unwrap_or(1) as usize;
         let hybrid_policy = std::env::var("VALKEY_HYBRID_POLICY").unwrap_or_default();
         let query_timeout: i64 = std::env::var("VALKEY_QUERY_TIMEOUT")
@@ -2160,7 +2350,7 @@ impl Engine for ValkeyEngine {
                             // build stay inside the timed window here to preserve
                             // its current measurement behavior exactly.
                             let query_start = Instant::now();
-                            let vec_bytes = encode_query_vector(&queries[idx]);
+                            let vec_bytes = encode_vector(&config.data_type, &queries[idx]);
                             let query_str = build_knn_query_str(parsed_filters[idx].as_ref());
                             let results = ft_search_knn(
                                 &mut conn,
@@ -2351,7 +2541,7 @@ impl Engine for ValkeyEngine {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_knn_query_str, encode_query_vector, parse_conditions, FilterParamValue, ParsedFilter,
+        build_knn_query_str, encode_vector, parse_conditions, FilterParamValue, ParsedFilter,
     };
     use std::collections::HashMap;
 
@@ -2361,19 +2551,33 @@ mod tests {
     // Prove the precomputed values are byte-identical to the in-window originals.
 
     #[test]
-    fn encode_query_vector_matches_legacy_fp32_le_bytes() {
+    fn encode_vector_matches_legacy_fp32_le_bytes() {
         let v = vec![1.0f32, -2.5, 3.25];
         // Legacy in-window encode was `iter().flat_map(f.to_le_bytes()).collect()`.
         let legacy: Vec<u8> = v.iter().flat_map(|f| f.to_le_bytes()).collect();
-        assert_eq!(encode_query_vector(&v), legacy);
+        assert_eq!(encode_vector("FLOAT32", &v), legacy);
+    }
+
+    // Query blobs must use the index element type: a FLOAT16 index rejects a
+    // FLOAT32 query blob ("query vector blob size ... does not match").
+    #[test]
+    fn encode_vector_uses_index_data_type() {
+        let v = vec![1.0f32, -2.5];
+        // f16: 1.0 = 0x3C00, -2.5 = 0xC100; bf16: 1.0 = 0x3F80, -2.5 = 0xC020.
+        assert_eq!(encode_vector("FLOAT16", &v), vec![0x00, 0x3C, 0x00, 0xC1]);
+        assert_eq!(encode_vector("BFLOAT16", &v), vec![0x80, 0x3F, 0x20, 0xC0]);
+        assert_eq!(encode_vector("FLOAT64", &v).len(), 16);
     }
 
     #[test]
     fn precomputed_blobs_match_per_query_encode() {
         let queries = [vec![1.0f32, -2.5, 3.5], vec![0.0f32, 42.0, -7.25]];
-        let precomputed: Vec<Vec<u8>> = queries.iter().map(|q| encode_query_vector(q)).collect();
+        let precomputed: Vec<Vec<u8>> = queries
+            .iter()
+            .map(|q| encode_vector("FLOAT16", q))
+            .collect();
         for (i, q) in queries.iter().enumerate() {
-            assert_eq!(precomputed[i], encode_query_vector(q), "q{i}");
+            assert_eq!(precomputed[i], encode_vector("FLOAT16", q), "q{i}");
         }
     }
 
@@ -2577,6 +2781,7 @@ mod tests {
             ef_construction: 128,
             data_type: "FLOAT32".to_string(),
             algorithm: "hnsw".to_string(),
+            svs: None,
             batch_size: 1,
             parallel: 1,
             skip_vector_index: false,
@@ -2995,5 +3200,126 @@ mod tests {
     #[test]
     fn exact_match_array_value_is_none() {
         assert!(exact_q(serde_json::json!({"value":[1,2]})).is_none());
+    }
+
+    // ── SVS_VAMANA ─────────────────────────────────────────────────────────
+
+    fn engine_from_json(cfg: serde_json::Value) -> super::ValkeyEngine {
+        let cfg: crate::config::EngineConfig = serde_json::from_value(cfg).unwrap();
+        super::ValkeyEngine::new(&cfg, "localhost").unwrap()
+    }
+
+    fn field_args(engine: &super::ValkeyEngine) -> Vec<String> {
+        super::vector_field_args(&engine.config, 768, "IP")
+    }
+
+    #[test]
+    fn hnsw_vector_field_args_unchanged() {
+        let e = engine_from_json(serde_json::json!({
+            "name": "v", "engine": "valkey",
+            "collection_params": {"hnsw_config": {"M": 32, "EF_CONSTRUCTION": 200}}
+        }));
+        assert!(e.config.svs.is_none());
+        assert_eq!(
+            field_args(&e),
+            [
+                "HNSW",
+                "10",
+                "TYPE",
+                "FLOAT32",
+                "DIM",
+                "768",
+                "DISTANCE_METRIC",
+                "IP",
+                "M",
+                "32",
+                "EF_CONSTRUCTION",
+                "200"
+            ]
+        );
+    }
+
+    #[test]
+    fn svs_vector_field_args_from_config_block() {
+        let e = engine_from_json(serde_json::json!({
+            "name": "v", "engine": "valkey",
+            "collection_params": {
+                "algorithm": "svs-vamana",
+                "data_type": "FLOAT16",
+                "svs-vamana_config": {
+                    "GRAPH_MAX_DEGREE": 64, "CONSTRUCTION_WINDOW_SIZE": 128,
+                    "ALPHA": 0.95, "compression": "LeanVec4x8", "REDUCE": 192,
+                    "TRAINING_THRESHOLD": 10240
+                }
+            }
+        }));
+        assert_eq!(
+            field_args(&e),
+            [
+                "SVS_VAMANA",
+                "18",
+                "TYPE",
+                "FLOAT16",
+                "DIM",
+                "768",
+                "DISTANCE_METRIC",
+                "IP",
+                "GRAPH_MAX_DEGREE",
+                "64",
+                "CONSTRUCTION_WINDOW_SIZE",
+                "128",
+                "ALPHA",
+                "0.95",
+                "COMPRESSION",
+                "LEANVEC4X8",
+                "REDUCE",
+                "192",
+                "TRAINING_THRESHOLD",
+                "10240"
+            ]
+        );
+    }
+
+    #[test]
+    fn svs_vector_field_args_derive_from_hnsw_params() {
+        let e = engine_from_json(serde_json::json!({
+            "name": "v", "engine": "valkey", "algorithm": "SVS",
+            "collection_params": {"hnsw_config": {"M": 16, "EF_CONSTRUCTION": 100}}
+        }));
+        assert_eq!(
+            field_args(&e),
+            [
+                "SVS_VAMANA",
+                "10",
+                "TYPE",
+                "FLOAT32",
+                "DIM",
+                "768",
+                "DISTANCE_METRIC",
+                "IP",
+                "GRAPH_MAX_DEGREE",
+                "32",
+                "CONSTRUCTION_WINDOW_SIZE",
+                "100"
+            ]
+        );
+    }
+
+    #[test]
+    fn resolve_ef_falls_back_to_search_window_size() {
+        let p = |v: serde_json::Value| -> crate::config::SearchParams {
+            serde_json::from_value(v).unwrap()
+        };
+        assert_eq!(
+            super::resolve_ef(&p(serde_json::json!({"search_params": {"ef": 99}}))),
+            99
+        );
+        assert_eq!(
+            super::resolve_ef(&p(
+                serde_json::json!({"search_params": {"SEARCH_WINDOW_SIZE": 77}})
+            )),
+            77
+        );
+        assert_eq!(super::resolve_ef(&p(serde_json::json!({}))), 64);
     }
 }
