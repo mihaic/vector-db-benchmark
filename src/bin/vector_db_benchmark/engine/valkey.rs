@@ -772,6 +772,95 @@ impl ValkeyEngine {
         Ok(results)
     }
 
+    /// One untimed pass over `queries` after a mixed --insert run, scored
+    /// against `allneighbors`. Returns (mean, p10, per-query recalls).
+    #[allow(clippy::too_many_arguments)]
+    fn verify_post_insert_recall(
+        &self,
+        dataset: &Dataset,
+        queries: &[Vec<f32>],
+        parsed_filters: &[Option<ParsedFilter>],
+        explicit_top: Option<usize>,
+        ef: i64,
+        hybrid_policy: &str,
+        query_timeout: i64,
+        parallel: usize,
+    ) -> Result<(f64, f64, Vec<f64>), String> {
+        let all_neighbors = dataset.read_all_neighbors()?;
+        if all_neighbors.len() < queries.len() {
+            return Err(format!(
+                "allneighbors has {} rows, fewer than the {} queries",
+                all_neighbors.len(),
+                queries.len()
+            ));
+        }
+        println!(
+            "\tVerifying recall against the full post-insert corpus ({} queries)...",
+            queries.len()
+        );
+        let query_idx = Arc::new(AtomicUsize::new(0));
+        let mut recalls: Vec<f64> = Vec::with_capacity(queries.len());
+        std::thread::scope(|s| {
+            let mut handles = Vec::with_capacity(parallel.max(1));
+            for _ in 0..parallel.max(1) {
+                let host = self.host.clone();
+                let port = self.port;
+                let config = &self.config;
+                let all_neighbors = &all_neighbors;
+                let query_idx = Arc::clone(&query_idx);
+                handles.push(s.spawn(move || {
+                    let mut local: Vec<f64> = Vec::new();
+                    let mut conn = match ValkeyEngine::connect(&host, port) {
+                        Ok(c) => c,
+                        Err(_) => return local,
+                    };
+                    loop {
+                        let idx = query_idx.fetch_add(1, Ordering::Relaxed);
+                        if idx >= queries.len() {
+                            break;
+                        }
+                        let top = explicit_top.unwrap_or_else(|| {
+                            let n = all_neighbors[idx].len();
+                            if n > 0 { n } else { 10 }
+                        });
+                        let vec_bytes = encode_vector(&config.data_type, &queries[idx]);
+                        let query_str = build_knn_query_str(parsed_filters[idx].as_ref());
+                        match ft_search_knn(
+                            &mut conn,
+                            &config.index_name,
+                            &vec_bytes,
+                            &query_str,
+                            top,
+                            ef,
+                            &config.algorithm,
+                            hybrid_policy,
+                            query_timeout,
+                            parsed_filters[idx].as_ref(),
+                        ) {
+                            Ok(result_ids) => {
+                                let ids: Vec<i64> = result_ids.iter().map(|(id, _)| *id).collect();
+                                local.push(crate::metrics::compute_metrics(&ids, &all_neighbors[idx], top).recall);
+                            }
+                            Err(e) => eprintln!("Post-insert recall query {} failed: {}", idx, e),
+                        }
+                    }
+                    local
+                }));
+            }
+            for h in handles {
+                recalls.extend(h.join().unwrap());
+            }
+        });
+        if recalls.is_empty() {
+            return Err("No post-insert recall queries completed".to_string());
+        }
+        let mean_recall = recalls.iter().sum::<f64>() / recalls.len() as f64;
+        let mut sorted = recalls.clone();
+        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let recall_p10 = crate::engine::percentile_linear(&sorted, 0.10);
+        Ok((mean_recall, recall_p10, recalls))
+    }
+
     fn create_progress_bar(&self, total: usize) -> ProgressBar {
         let pb = ProgressBar::new(total as u64);
         pb.set_style(
@@ -2220,7 +2309,7 @@ impl Engine for ValkeyEngine {
         params: &SearchParams,
         num_queries: i64,
         ratio: &UpdateSearchRatio,
-        _use_insert: bool,
+        use_insert: bool,
     ) -> Result<SearchResults, String> {
         // Prime the datetime/text field-type maps from the schema so the update
         // half of the mixed workload encodes datetime payloads as epoch seconds
@@ -2254,10 +2343,20 @@ impl Engine for ValkeyEngine {
             .map(|c| c.as_ref().and_then(parse_conditions))
             .collect();
 
-        // Read vectors for updates
+        if neighbors.len() < queries.len() {
+            return Err("dataset ground-truth shorter than query set".into());
+        }
+
+        // Read vectors for updates: the dataset's `insert` set (new points) with
+        // --insert, otherwise the upload corpus (re-upserting existing points).
         let normalize = dataset.needs_normalization();
-        println!("\tReading vectors for updates...");
-        let (upd_ids, upd_vectors, upd_metadata) = dataset.read_vectors(normalize)?;
+        let (upd_ids, upd_vectors, upd_metadata) = if use_insert {
+            println!("\tReading insert vectors for updates...");
+            dataset.read_insert_vectors(normalize)?
+        } else {
+            println!("\tReading vectors for updates...");
+            dataset.read_vectors(normalize)?
+        };
 
         // Create deterministic shuffled update sequence
         let mut update_seq: Vec<usize> = (0..upd_ids.len()).collect();
@@ -2265,7 +2364,14 @@ impl Engine for ValkeyEngine {
         update_seq.shuffle(&mut rng);
 
         let explicit_top: Option<usize> = params.top.map(|t| t as usize);
-        let num_to_run = if num_queries > 0 {
+        let closed_loop_duration = crate::engine::closed_loop_duration(params)?;
+        // With --insert the run stops once every insert vector has been used
+        // exactly once; with a duration it stops at the deadline. In both cases
+        // queries recycle (`query_pos = idx % queries.len()`).
+        let unbounded = closed_loop_duration.is_some() || use_insert;
+        let num_to_run = if unbounded {
+            usize::MAX
+        } else if num_queries > 0 {
             (num_queries as usize).min(queries.len())
         } else {
             queries.len()
@@ -2278,8 +2384,9 @@ impl Engine for ValkeyEngine {
         let ratio_updates = ratio.updates as usize;
         let update_seq_len = update_seq.len();
 
-        let pb = self.create_progress_bar(num_to_run);
+        let pb = self.create_progress_bar(if unbounded { 0 } else { num_to_run });
         let start_time = Instant::now();
+        let sample_capacity = if unbounded { queries.len() } else { num_to_run };
 
         // Each worker accumulates search + update samples into thread-local
         // buffers and returns them on join; the main thread concatenates. This
@@ -2287,11 +2394,11 @@ impl Engine for ValkeyEngine {
         // per query that serialized workers at high parallelism (matching the main
         // search() path). Dispatch counters use Relaxed (only their own
         // monotonicity matters) and the progress bar is advanced in batches.
-        let mut times: Vec<f64> = Vec::with_capacity(num_to_run);
-        let mut precs: Vec<f64> = Vec::with_capacity(num_to_run);
-        let mut recs: Vec<f64> = Vec::with_capacity(num_to_run);
-        let mut mrr_vals: Vec<f64> = Vec::with_capacity(num_to_run);
-        let mut ndcg_vals: Vec<f64> = Vec::with_capacity(num_to_run);
+        let mut times: Vec<f64> = Vec::with_capacity(sample_capacity);
+        let mut precs: Vec<f64> = Vec::with_capacity(sample_capacity);
+        let mut recs: Vec<f64> = Vec::with_capacity(sample_capacity);
+        let mut mrr_vals: Vec<f64> = Vec::with_capacity(sample_capacity);
+        let mut ndcg_vals: Vec<f64> = Vec::with_capacity(sample_capacity);
         let mut u_times: Vec<f64> = Vec::new();
 
         std::thread::scope(|s| {
@@ -2329,15 +2436,23 @@ impl Engine for ValkeyEngine {
                     };
 
                     'outer: loop {
+                        // Deadline checked once per full search+update round.
+                        if closed_loop_duration
+                            .map(|duration| Instant::now() >= start_time + duration)
+                            .unwrap_or(false)
+                        {
+                            break 'outer;
+                        }
                         // Search phase: do S searches
                         for _ in 0..ratio_searches {
                             let idx = search_idx.fetch_add(1, Ordering::Relaxed);
                             if idx >= num_to_run {
                                 break 'outer;
                             }
+                            let query_pos = idx % queries.len();
 
                             let top = explicit_top.unwrap_or_else(|| {
-                                let n = neighbors[idx].len();
+                                let n = neighbors[query_pos].len();
                                 if n > 0 {
                                     n
                                 } else {
@@ -2350,8 +2465,8 @@ impl Engine for ValkeyEngine {
                             // build stay inside the timed window here to preserve
                             // its current measurement behavior exactly.
                             let query_start = Instant::now();
-                            let vec_bytes = encode_vector(&config.data_type, &queries[idx]);
-                            let query_str = build_knn_query_str(parsed_filters[idx].as_ref());
+                            let vec_bytes = encode_vector(&config.data_type, &queries[query_pos]);
+                            let query_str = build_knn_query_str(parsed_filters[query_pos].as_ref());
                             let results = ft_search_knn(
                                 &mut conn,
                                 &config.index_name,
@@ -2362,7 +2477,7 @@ impl Engine for ValkeyEngine {
                                 &algorithm,
                                 &hybrid_policy,
                                 query_timeout,
-                                parsed_filters[idx].as_ref(),
+                                parsed_filters[query_pos].as_ref(),
                             );
                             let query_time = query_start.elapsed().as_secs_f64();
 
@@ -2372,7 +2487,7 @@ impl Engine for ValkeyEngine {
                                         result_ids.iter().map(|(id, _)| *id).collect();
                                     let m = crate::metrics::compute_metrics(
                                         &ordered_ids,
-                                        &neighbors[idx],
+                                        &neighbors[query_pos],
                                         top,
                                     );
                                     t.push(query_time);
@@ -2395,6 +2510,9 @@ impl Engine for ValkeyEngine {
                         // Update phase: do U updates
                         for _ in 0..ratio_updates {
                             let uidx = update_idx.fetch_add(1, Ordering::Relaxed);
+                            if use_insert && uidx >= update_seq_len {
+                                break 'outer;
+                            }
                             let data_idx = update_seq[uidx % update_seq_len];
 
                             let update_start = Instant::now();
@@ -2466,8 +2584,10 @@ impl Engine for ValkeyEngine {
         // Search latency + quality stats through the shared percentile path so the
         // mixed harness matches the main search() footing.
         let top = explicit_top.unwrap_or_else(|| neighbors.first().map(|n| n.len()).unwrap_or(10));
+        // Dispatched searches, as in the Redis engine (failures = attempted - completed).
+        let attempted = search_idx.load(Ordering::Relaxed).min(num_to_run);
         let mut results = crate::engine::compute_search_stats(
-            &times, &precs, &recs, &mrr_vals, &ndcg_vals, total_time, top, parallel, num_to_run,
+            &times, &precs, &recs, &mrr_vals, &ndcg_vals, total_time, top, parallel, attempted,
         )?;
         results.update_count = update_count;
         results.update_rps = update_rps;
@@ -2477,6 +2597,25 @@ impl Engine for ValkeyEngine {
         results.update_p99_time = update_p99;
         results.update_latencies = Some(u_times);
         results.update_search_ratio = Some(format!("{}:{}", ratio.updates, ratio.searches));
+
+        // With --insert, score one fresh pass over every query against
+        // `allneighbors` (ground truth for train + insert). Best effort.
+        if use_insert {
+            match self.verify_post_insert_recall(
+                dataset, &queries, &parsed_filters, explicit_top, ef, &hybrid_policy, query_timeout, parallel,
+            ) {
+                Ok((mean_recall, recall_p10, recalls)) => {
+                    println!(
+                        "\tPost-insert recall (allneighbors): mean={:.4}, p10={:.4}",
+                        mean_recall, recall_p10
+                    );
+                    results.post_insert_mean_recall = Some(mean_recall);
+                    results.post_insert_recall_p10 = Some(recall_p10);
+                    results.post_insert_recalls = Some(recalls);
+                }
+                Err(e) => println!("\tSkipping post-insert recall check: {}", e),
+            }
+        }
         Ok(results)
     }
 

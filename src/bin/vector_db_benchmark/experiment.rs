@@ -193,12 +193,12 @@ pub fn run(args: &Args) -> Result<(), String> {
             .iter()
             .filter_map(|(name, config)| {
                 let engine_type = config.engine.as_deref().unwrap_or("unknown");
-                (engine_type != "redis").then_some(name.as_str())
+                (engine_type != "redis" && engine_type != "valkey").then_some(name.as_str())
             })
             .collect();
         if !unsupported.is_empty() {
             return Err(format!(
-                "--insert currently supports the Redis engine only; unsupported: {}",
+                "--insert currently supports the Redis and Valkey engines only; unsupported: {}",
                 unsupported.join(", ")
             ));
         }
